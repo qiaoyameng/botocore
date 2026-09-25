@@ -11,7 +11,9 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import copy
+import threading
 from collections import deque
+from contextlib import contextmanager
 from pprint import pformat
 
 from botocore.awsrequest import AWSResponse
@@ -41,6 +43,22 @@ class _ANY:
 
 
 ANY = _ANY()
+
+
+class _UnorderedGroup:
+    """
+    A set of expected responses that can be matched in any order.
+
+    Responses are added to the group while it is open (see
+    ``Stubber.unordered_group``). An incoming API call is matched against
+    the remaining responses in the group by operation name and expected
+    parameters rather than by queue position. The responses queued after
+    the group are only matched once every response in the group has been
+    consumed.
+    """
+
+    def __init__(self):
+        self.responses = []
 
 
 class Stubber:
@@ -163,6 +181,37 @@ class Stubber:
             service_response = s3.list_objects(Bucket='test-bucket')
 
         assert service_response == response
+
+
+    If your code makes API calls concurrently and therefore cannot
+    guarantee the order in which they are made, you can group the
+    corresponding stubs with ``unordered_group``. Responses inside the
+    group are matched by operation name and expected parameters instead
+    of by queue position. Responses queued outside of the group keep
+    their first in, first out ordering, and are only matched once every
+    response inside the group has been consumed. A call that matches no
+    response in the group, or that matches more than one, raises an
+    error and consumes nothing.
+
+    **Example:**
+    ::
+        import botocore.session
+        from botocore.stub import Stubber
+
+
+        s3 = botocore.session.get_session().create_client('s3')
+
+        with Stubber(s3) as stubber:
+            with stubber.unordered_group():
+                stubber.add_response(
+                    'list_objects', {}, {'Bucket': 'bucket-one'}
+                )
+                stubber.add_response(
+                    'list_objects', {}, {'Bucket': 'bucket-two'}
+                )
+            # These calls can be made in either order.
+            s3.list_objects(Bucket='bucket-two')
+            s3.list_objects(Bucket='bucket-one')
     """
 
     def __init__(self, client):
@@ -174,6 +223,9 @@ class Stubber:
         self._expected_params_event_id = 'boto_stubber_expected_params'
         self._stub_account_id_event_id = 'boto_stubber_stub_account_id'
         self._queue = deque()
+        self._current_group = None
+        self._lock = threading.Lock()
+        self._group_match_context_key = 'boto_stubber_group_match'
 
     def __enter__(self):
         self.activate()
@@ -181,6 +233,37 @@ class Stubber:
 
     def __exit__(self, exception_type, exception_value, traceback):
         self.deactivate()
+
+    @contextmanager
+    def unordered_group(self):
+        """
+        Groups stubbed responses so they can be matched in any order.
+
+        Responses added inside the ``with`` block (via ``add_response``
+        or ``add_client_error``) are matched against incoming API calls
+        by operation name and expected parameters rather than by their
+        position in the queue. This is useful when the code under test
+        makes API calls concurrently and their order is not deterministic.
+        Responses queued before or after the group keep their first in,
+        first out ordering, and calls are never matched against responses
+        queued after the group while the group still has remaining
+        responses. Groups cannot be nested.
+        """
+        if self._current_group is not None:
+            raise ValueError('Unordered groups cannot be nested.')
+        group = _UnorderedGroup()
+        self._current_group = group
+        try:
+            yield
+        finally:
+            self._current_group = None
+            self._queue.append(group)
+
+    def _queue_response(self, response):
+        if self._current_group is not None:
+            self._current_group.responses.append(response)
+        else:
+            self._queue.append(response)
 
     def activate(self):
         """
@@ -266,7 +349,7 @@ class Stubber:
             'response': (http_response, service_response),
             'expected_params': expected_params,
         }
-        self._queue.append(response)
+        self._queue_response(response)
 
     def add_client_error(
         self,
@@ -348,18 +431,103 @@ class Stubber:
             'response': (http_response, parsed_response),
             'expected_params': expected_params,
         }
-        self._queue.append(response)
+        self._queue_response(response)
 
     def assert_no_pending_responses(self):
         """
         Asserts that all expected calls were made.
         """
-        remaining = len(self._queue)
-        if remaining != 0:
-            raise AssertionError(f"{remaining} responses remaining in queue.")
+        remaining = []
+        count = 0
+        for item in self._queue:
+            if isinstance(item, _UnorderedGroup):
+                if item.responses:
+                    count += len(item.responses)
+                    names = [
+                        response['operation_name']
+                        for response in item.responses
+                    ]
+                    remaining.append(f"unordered group ({', '.join(names)})")
+            else:
+                count += 1
+                remaining.append(item['operation_name'])
+        if count != 0:
+            raise AssertionError(
+                f"{count} responses remaining in queue: "
+                f"{', '.join(remaining)}."
+            )
+
+    def _peek_head(self):
+        # Discard any unordered groups that have been fully consumed.
+        while self._queue and self._is_empty_group(self._queue[0]):
+            self._queue.popleft()
+        if self._queue:
+            return self._queue[0]
+        return None
+
+    @staticmethod
+    def _is_empty_group(item):
+        return isinstance(item, _UnorderedGroup) and not item.responses
+
+    @staticmethod
+    def _params_match(expected_params, params):
+        if expected_params is None:
+            return True
+        for param, value in expected_params.items():
+            if param not in params or value != params[param]:
+                return False
+        return sorted(expected_params.keys()) == sorted(params.keys())
+
+    def _find_group_matches(self, group, operation_name, params):
+        return [
+            response
+            for response in group.responses
+            if response['operation_name'] == operation_name
+            and self._params_match(response['expected_params'], params)
+        ]
+
+    def _assert_group_match(self, group, model, params):
+        matches = self._find_group_matches(group, model.name, params)
+        if not matches:
+            remaining = [
+                response['operation_name'] for response in group.responses
+            ]
+            if model.name not in remaining:
+                raise StubResponseError(
+                    operation_name=model.name,
+                    reason=(
+                        f'Operation mismatch: no response for {model.name} '
+                        'remains in the current unordered group. Expected '
+                        f'one of: {remaining}.'
+                    ),
+                )
+            expected = [
+                response['expected_params']
+                for response in group.responses
+                if response['operation_name'] == model.name
+            ]
+            raise StubAssertionError(
+                operation_name=model.name,
+                reason=(
+                    f'Expected one of the parameters:\n{pformat(expected)},\n'
+                    f'but received:\n{pformat(params)}'
+                ),
+            )
+        if len(matches) > 1:
+            raise StubResponseError(
+                operation_name=model.name,
+                reason=(
+                    f'Ambiguous API Call: the call to {model.name} matches '
+                    f'{len(matches)} responses in the current unordered '
+                    'group. Make the expected parameters of the stubbed '
+                    'responses in the group mutually exclusive.'
+                ),
+            )
+        return matches
 
     def _assert_expected_call_order(self, model, params):
-        if not self._queue:
+        head = self._peek_head()
+        if head is None:
             raise UnStubbedResponseError(
                 operation_name=model.name,
                 reason=(
@@ -368,8 +536,10 @@ class Stubber:
                     'it was called multiple times.'
                 ),
             )
-
-        name = self._queue[0]['operation_name']
+        if isinstance(head, _UnorderedGroup):
+            self._assert_group_match(head, model, params)
+            return
+        name = head['operation_name']
         if name != model.name:
             raise StubResponseError(
                 operation_name=model.name,
@@ -385,21 +555,76 @@ class Stubber:
             builtins['AWS::Auth::AccountId'] = None
 
     def _get_response_handler(self, model, params, context, **kwargs):
-        self._assert_expected_call_order(model, params)
-        # Pop off the entire response once everything has been validated
-        return self._queue.popleft()['response']
+        with self._lock:
+            head = self._peek_head()
+            if isinstance(head, _UnorderedGroup):
+                return self._get_group_response(head, model, context)
+            self._assert_expected_call_order(model, params)
+            # Pop off the entire response once everything has been validated
+            return self._queue.popleft()['response']
+
+    def _get_group_response(self, group, model, context):
+        # The call was matched against the group when its parameters were
+        # validated. Consume exactly the response that was matched so
+        # that concurrent calls can never consume the same response twice.
+        match = None
+        if isinstance(context, dict):
+            match = context.get(self._group_match_context_key)
+        if match is not None and any(
+            response is match for response in group.responses
+        ):
+            group.responses.remove(match)
+            if not group.responses:
+                self._queue.popleft()
+            return match['response']
+        raise UnStubbedResponseError(
+            operation_name=model.name,
+            reason=(
+                'Unexpected API Call: A call was made but the response it '
+                'matched in the current unordered group was already '
+                'consumed. Either the API Call was not stubbed or it was '
+                'called multiple times.'
+            ),
+        )
 
     def _assert_expected_params(self, model, params, context, **kwargs):
         if self._should_not_stub(context):
             return
-        self._assert_expected_call_order(model, params)
-        expected_params = self._queue[0]['expected_params']
-        if expected_params is None:
-            return
+        with self._lock:
+            head = self._peek_head()
+            if isinstance(head, _UnorderedGroup):
+                # Match the call against the operation name and expected
+                # parameters of the remaining responses in the group and
+                # remember the match so that _get_response_handler can
+                # consume exactly this response. The request context is
+                # unique to each API call, making this safe to use from
+                # concurrent threads.
+                match = self._assert_group_match(head, model, params)[0]
+                if isinstance(context, dict):
+                    context[self._group_match_context_key] = match
+                return
+            self._assert_expected_call_order(model, params)
+            expected_params = head['expected_params']
+            if expected_params is None:
+                return
 
-        # Validate the parameters are equal
-        for param, value in expected_params.items():
-            if param not in params or expected_params[param] != params[param]:
+            # Validate the parameters are equal
+            for param, value in expected_params.items():
+                if (
+                    param not in params
+                    or expected_params[param] != params[param]
+                ):
+                    raise StubAssertionError(
+                        operation_name=model.name,
+                        reason=(
+                            f'Expected parameters:\n'
+                            f'{pformat(expected_params)},\n'
+                            f'but received:\n{pformat(params)}'
+                        ),
+                    )
+
+            # Ensure there are no extra params hanging around
+            if sorted(expected_params.keys()) != sorted(params.keys()):
                 raise StubAssertionError(
                     operation_name=model.name,
                     reason=(
@@ -407,16 +632,6 @@ class Stubber:
                         f'but received:\n{pformat(params)}'
                     ),
                 )
-
-        # Ensure there are no extra params hanging around
-        if sorted(expected_params.keys()) != sorted(params.keys()):
-            raise StubAssertionError(
-                operation_name=model.name,
-                reason=(
-                    f'Expected parameters:\n{pformat(expected_params)},\n'
-                    f'but received:\n{pformat(params)}'
-                ),
-            )
 
     def _should_not_stub(self, context):
         # Do not include presign requests when processing stubbed client calls

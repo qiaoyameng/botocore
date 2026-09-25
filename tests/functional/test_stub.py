@@ -10,6 +10,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import threading
 from unittest import mock
 
 import botocore
@@ -431,3 +432,223 @@ class TestStubber(unittest.TestCase):
                 with stubber:
                     response = client.list_tables()
                 self.assertEqual(response, service_response)
+
+
+class TestStubberUnorderedGroup(unittest.TestCase):
+    def setUp(self):
+        session = botocore.session.get_session()
+        config = botocore.config.Config(
+            signature_version=botocore.UNSIGNED,
+            s3={'addressing_style': 'path'},
+        )
+        self.client = session.create_client(
+            's3', region_name='us-east-1', config=config
+        )
+        self.stubber = Stubber(self.client)
+
+    def test_unordered_group_allows_any_order(self):
+        list_objects_response = {'Name': 'mybucket'}
+        list_buckets_response = {
+            'Buckets': [{'Name': 'mybucket'}],
+        }
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', list_objects_response, {'Bucket': 'mybucket'}
+            )
+            self.stubber.add_response('list_buckets', list_buckets_response)
+
+        with self.stubber:
+            # Call the operations in the opposite order they were stubbed.
+            actual_list_buckets = self.client.list_buckets()
+            actual_list_objects = self.client.list_objects(Bucket='mybucket')
+
+        self.assertEqual(actual_list_buckets, list_buckets_response)
+        self.assertEqual(actual_list_objects, list_objects_response)
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_same_operation_different_params(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects',
+                {'Name': 'bucket-one'},
+                {'Bucket': 'bucket-one'},
+            )
+            self.stubber.add_response(
+                'list_objects',
+                {'Name': 'bucket-two'},
+                {'Bucket': 'bucket-two'},
+            )
+
+        with self.stubber:
+            response_two = self.client.list_objects(Bucket='bucket-two')
+            response_one = self.client.list_objects(Bucket='bucket-one')
+
+        self.assertEqual(response_two['Name'], 'bucket-two')
+        self.assertEqual(response_one['Name'], 'bucket-one')
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_identical_responses_are_ambiguous(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+
+        with self.stubber:
+            with self.assertRaisesRegex(StubResponseError, 'Ambiguous'):
+                self.client.list_objects(Bucket='mybucket')
+
+        # The ambiguous call must not have consumed either response.
+        with self.assertRaisesRegex(AssertionError, '2 responses remaining'):
+            self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_nested_any(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'put_object',
+                {},
+                {
+                    'Bucket': 'mybucket',
+                    'Key': 'mykey',
+                    'Metadata': {'MyMeta': stub.ANY},
+                },
+            )
+            self.stubber.add_response('list_buckets', {})
+
+        with self.stubber:
+            self.client.list_buckets()
+            self.client.put_object(
+                Bucket='mybucket',
+                Key='mykey',
+                Metadata={'MyMeta': 'anything'},
+            )
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_unmatched_call_consumes_nothing(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+
+        with self.stubber:
+            with self.assertRaises(StubAssertionError):
+                self.client.list_objects(Bucket='otherbucket')
+            # The failed call did not consume the stubbed response.
+            self.client.list_objects(Bucket='mybucket')
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_blocks_queued_responses_until_drained(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+        self.stubber.add_response('list_buckets', {})
+
+        with self.stubber:
+            # The response queued after the group cannot be matched while
+            # the group still has remaining responses.
+            with self.assertRaisesRegex(StubResponseError, 'ListObjects'):
+                self.client.list_buckets()
+            self.client.list_objects(Bucket='mybucket')
+            self.client.list_buckets()
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_client_error_consumes_match(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_client_error(
+                'list_buckets', 'AccessDenied', 'Access Denied'
+            )
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+
+        with self.stubber:
+            self.client.list_objects(Bucket='mybucket')
+            with self.assertRaises(ClientError):
+                self.client.list_buckets()
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_cannot_be_nested(self):
+        with self.stubber.unordered_group():
+            with self.assertRaises(ValueError):
+                with self.stubber.unordered_group():
+                    pass
+
+    def test_assert_no_pending_responses_lists_group_members(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+            self.stubber.add_response('list_buckets', {})
+        self.stubber.add_response('list_objects', {}, {'Bucket': 'other'})
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r'3 responses remaining in queue: '
+            r'unordered group \(ListObjects, ListBuckets\), ListObjects',
+        ):
+            self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_threaded_distinct_calls(self):
+        buckets = [f'bucket-{i}' for i in range(4)]
+        with self.stubber.unordered_group():
+            for bucket in buckets:
+                self.stubber.add_response(
+                    'list_objects', {'Name': bucket}, {'Bucket': bucket}
+                )
+
+        errors = []
+
+        def call_list_objects(bucket):
+            try:
+                response = self.client.list_objects(Bucket=bucket)
+                self.assertEqual(response['Name'], bucket)
+            except Exception as e:
+                errors.append(e)
+
+        with self.stubber:
+            threads = [
+                threading.Thread(target=call_list_objects, args=(bucket,))
+                for bucket in buckets
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.stubber.assert_no_pending_responses()
+
+    def test_unordered_group_threaded_response_consumed_once(self):
+        with self.stubber.unordered_group():
+            self.stubber.add_response(
+                'list_objects', {}, {'Bucket': 'mybucket'}
+            )
+
+        successes = []
+        failures = []
+
+        def call_list_objects():
+            try:
+                self.client.list_objects(Bucket='mybucket')
+                successes.append(True)
+            except StubResponseError:
+                failures.append(True)
+
+        with self.stubber:
+            threads = [
+                threading.Thread(target=call_list_objects) for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        # Two threads raced for a single stubbed response. Exactly one of
+        # them consumed it; the other was rejected instead of consuming
+        # the same response twice.
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.stubber.assert_no_pending_responses()
