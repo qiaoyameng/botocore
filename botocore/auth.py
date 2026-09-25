@@ -40,6 +40,9 @@ from botocore.compat import (
 from botocore.exceptions import (
     NoAuthTokenError,
     NoCredentialsError,
+    PresignedPostContradictionError,
+    PresignedPostMissingConditionError,
+    PresignedPostUnknownConditionError,
     UnknownSignatureVersionError,
     UnsupportedSignatureVersionError,
 )
@@ -561,6 +564,229 @@ class S3ExpressAuth(S3SigV4Auth):
             del request.headers['X-Amz-Security-Token']
 
 
+# Form fields that never require a matching policy condition.
+_PRESIGN_POST_EXEMPT_FIELDS = frozenset(
+    [
+        'AWSAccessKeyId',
+        'file',
+        'policy',
+        'signature',
+        'submit',
+        'x-amz-signature',
+    ]
+)
+
+# Fields whose values must never be included in validation error
+# messages because they contain credentials or signatures.
+_PRESIGN_POST_SENSITIVE_FIELDS = frozenset(
+    [
+        'AWSAccessKeyId',
+        'policy',
+        'signature',
+        'x-amz-credential',
+        'x-amz-s3session-token',
+        'x-amz-security-token',
+        'x-amz-signature',
+    ]
+)
+
+# Placeholder that S3 clients substitute with the uploaded file's name.
+_PRESIGN_POST_FILENAME_PLACEHOLDER = '${filename}'
+
+
+def _summarize_presign_post_condition(condition):
+    # Describe a condition without exposing any of its values so that
+    # credentials or signatures are never leaked into error messages.
+    if isinstance(condition, Mapping):
+        keys = sorted(str(key) for key in condition)
+        return f'mapping condition for field(s) {keys}'
+    if isinstance(condition, (list, tuple)) and condition:
+        return f'list condition with operator {condition[0]!r}'
+    return f'{type(condition).__name__} condition'
+
+
+def _iter_presign_post_conditions(condition):
+    # Normalize a policy condition into (operator, field, value) tuples.
+    if isinstance(condition, Mapping):
+        for field, value in condition.items():
+            yield 'eq', field, value
+        return
+    if isinstance(condition, (list, tuple)) and condition:
+        operator = condition[0]
+        if operator in ('eq', 'starts-with') and len(condition) == 3:
+            field = condition[1]
+            if isinstance(field, str) and field.startswith('$'):
+                field = field[1:]
+            yield operator, field, condition[2]
+            return
+        if (
+            operator == 'content-length-range'
+            and len(condition) == 3
+            and isinstance(condition[1], (int, float))
+            and isinstance(condition[2], (int, float))
+        ):
+            yield operator, 'content-length-range', (
+                condition[1],
+                condition[2],
+            )
+            return
+    raise PresignedPostUnknownConditionError(
+        condition=_summarize_presign_post_condition(condition)
+    )
+
+
+def _format_presign_post_value(field, value):
+    if field in _PRESIGN_POST_SENSITIVE_FIELDS:
+        return '<redacted>'
+    return repr(value)
+
+
+def validate_presigned_post_policy(fields, conditions):
+    """Validate that presigned POST fields satisfy the policy conditions.
+
+    Recognizes ``eq``, ``starts-with`` and ``content-length-range`` list
+    conditions as well as single key/value mappings (exact match). Multiple
+    constraints on the same field are intersected; a definite contradiction
+    means S3 would reject any upload using the returned fields.
+
+    :raises PresignedPostUnknownConditionError: A condition uses an
+        unsupported operator or malformed structure.
+    :raises PresignedPostContradictionError: Constraints on a field cannot
+        be satisfied simultaneously, or a field value violates a condition.
+    :raises PresignedPostMissingConditionError: A form field has no
+        matching condition in the policy.
+    """
+    equalities = {}
+    prefixes = {}
+    length_ranges = []
+    for condition in conditions:
+        for operator, field, value in _iter_presign_post_conditions(
+            condition
+        ):
+            if operator == 'eq':
+                values = equalities.setdefault(field, [])
+                if value not in values:
+                    values.append(value)
+            elif operator == 'starts-with':
+                prefixes.setdefault(field, []).append(value)
+            else:
+                length_ranges.append(value)
+
+    for field, values in equalities.items():
+        if len(values) > 1:
+            formatted = ', '.join(
+                _format_presign_post_value(field, value) for value in values
+            )
+            raise PresignedPostContradictionError(
+                field=field,
+                reason=f'multiple different exact-match values: {formatted}',
+            )
+
+    for field, field_prefixes in prefixes.items():
+        for index, prefix in enumerate(field_prefixes):
+            for other in field_prefixes[index + 1 :]:
+                if isinstance(prefix, str) and isinstance(other, str):
+                    compatible = prefix.startswith(other) or other.startswith(
+                        prefix
+                    )
+                else:
+                    compatible = prefix == other
+                if not compatible:
+                    raise PresignedPostContradictionError(
+                        field=field,
+                        reason=(
+                            'incompatible starts-with prefixes '
+                            f'{_format_presign_post_value(field, prefix)} '
+                            'and '
+                            f'{_format_presign_post_value(field, other)}'
+                        ),
+                    )
+
+    for field, values in equalities.items():
+        value = values[0]
+        for prefix in prefixes.get(field, []):
+            if isinstance(value, str) and isinstance(prefix, str):
+                satisfied = value.startswith(prefix)
+            else:
+                satisfied = value == prefix
+            if not satisfied:
+                raise PresignedPostContradictionError(
+                    field=field,
+                    reason=(
+                        'exact-match value '
+                        f'{_format_presign_post_value(field, value)} does '
+                        'not start with required prefix '
+                        f'{_format_presign_post_value(field, prefix)}'
+                    ),
+                )
+
+    for lower, upper in length_ranges:
+        if lower > upper:
+            raise PresignedPostContradictionError(
+                field='content-length-range',
+                reason=f'lower bound {lower} exceeds upper bound {upper}',
+            )
+    if length_ranges:
+        max_lower = max(bounds[0] for bounds in length_ranges)
+        min_upper = min(bounds[1] for bounds in length_ranges)
+        if max_lower > min_upper:
+            raise PresignedPostContradictionError(
+                field='content-length-range',
+                reason=(
+                    f'ranges do not overlap; largest lower bound is '
+                    f'{max_lower} but smallest upper bound is {min_upper}'
+                ),
+            )
+
+    for field, value in fields.items():
+        if not isinstance(field, str):
+            continue
+        if (
+            field in _PRESIGN_POST_EXEMPT_FIELDS
+            or field.startswith('x-ignore-')
+        ):
+            continue
+        field_equalities = equalities.get(field, [])
+        field_prefixes = prefixes.get(field, [])
+        if not field_equalities and not field_prefixes:
+            raise PresignedPostMissingConditionError(field=field)
+        if (
+            field == 'key'
+            and isinstance(value, str)
+            and value.endswith(_PRESIGN_POST_FILENAME_PLACEHOLDER)
+        ):
+            # ${filename} is substituted by the uploader, so the final
+            # value cannot be checked locally; the conditions themselves
+            # were already intersected above.
+            continue
+        for expected in field_equalities:
+            if value != expected:
+                raise PresignedPostContradictionError(
+                    field=field,
+                    reason=(
+                        'field value '
+                        f'{_format_presign_post_value(field, value)} does '
+                        'not match required value '
+                        f'{_format_presign_post_value(field, expected)}'
+                    ),
+                )
+        for prefix in field_prefixes:
+            if isinstance(value, str) and isinstance(prefix, str):
+                satisfied = value.startswith(prefix)
+            else:
+                satisfied = value == prefix
+            if not satisfied:
+                raise PresignedPostContradictionError(
+                    field=field,
+                    reason=(
+                        'field value '
+                        f'{_format_presign_post_value(field, value)} does '
+                        'not start with required prefix '
+                        f'{_format_presign_post_value(field, prefix)}'
+                    ),
+                )
+
+
 class S3ExpressPostAuth(S3ExpressAuth):
     REQUIRES_IDENTITY_CACHE = True
 
@@ -594,6 +820,9 @@ class S3ExpressPostAuth(S3ExpressAuth):
             conditions.append(
                 {'X-Amz-S3session-Token': self.credentials.token}
             )
+
+        if request.context.get('s3-presign-post-validate-policy'):
+            validate_presigned_post_policy(fields, conditions)
 
         # Dump the base64 encoded policy into the fields dictionary.
         fields['policy'] = base64.b64encode(
@@ -851,6 +1080,9 @@ class S3SigV4PostAuth(SigV4Auth):
         if self.credentials.token is not None:
             fields['x-amz-security-token'] = self.credentials.token
             conditions.append({'x-amz-security-token': self.credentials.token})
+
+        if request.context.get('s3-presign-post-validate-policy'):
+            validate_presigned_post_policy(fields, conditions)
 
         # Dump the base64 encoded policy into the fields dictionary.
         fields['policy'] = base64.b64encode(
@@ -1113,6 +1345,9 @@ class HmacV1PostAuth(HmacV1Auth):
         if self.credentials.token is not None:
             fields['x-amz-security-token'] = self.credentials.token
             conditions.append({'x-amz-security-token': self.credentials.token})
+
+        if request.context.get('s3-presign-post-validate-policy'):
+            validate_presigned_post_policy(fields, conditions)
 
         # Dump the base64 encoded policy into the fields dictionary.
         fields['policy'] = base64.b64encode(

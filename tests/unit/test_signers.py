@@ -25,6 +25,9 @@ from botocore.credentials import Credentials, ReadOnlyCredentials
 from botocore.exceptions import (
     NoRegionError,
     ParamValidationError,
+    PresignedPostContradictionError,
+    PresignedPostMissingConditionError,
+    PresignedPostUnknownConditionError,
     UnknownClientMethodError,
     UnknownSignatureVersionError,
     UnsupportedSignatureVersionError,
@@ -825,6 +828,30 @@ class TestS3PostPresigner(BaseSignerTest):
             service_name='signing_name',
         )
 
+    def test_generate_presigned_post_validate_policy_sets_context(self):
+        with mock.patch.dict(
+            botocore.auth.AUTH_TYPE_MAPS, {'s3v4-presign-post': self.auth}
+        ):
+            self.signer.generate_presigned_post(
+                self.request_dict, validate_policy=True
+            )
+        self.assertEqual(self.add_auth.call_count, 1)
+        ref_request = self.add_auth.call_args[0][0]
+        self.assertTrue(
+            ref_request.context['s3-presign-post-validate-policy']
+        )
+
+    def test_generate_presigned_post_no_validate_policy_by_default(self):
+        with mock.patch.dict(
+            botocore.auth.AUTH_TYPE_MAPS, {'s3v4-presign-post': self.auth}
+        ):
+            self.signer.generate_presigned_post(self.request_dict)
+        self.assertEqual(self.add_auth.call_count, 1)
+        ref_request = self.add_auth.call_args[0][0]
+        self.assertNotIn(
+            's3-presign-post-validate-policy', ref_request.context
+        )
+
     def test_presigned_post_throws_unsupported_signature_error(self):
         request_dict = {
             'headers': {},
@@ -1129,6 +1156,298 @@ class TestGeneratePresignedPost(unittest.TestCase):
         self.client = self.session.create_client('ec2', 'us-west-2')
         with self.assertRaises(AttributeError):
             self.client.generate_presigned_post()
+
+
+class TestValidatePresignedPostPolicy(unittest.TestCase):
+    def validate(self, fields, conditions):
+        botocore.auth.validate_presigned_post_policy(fields, conditions)
+
+    def test_valid_policy(self):
+        self.validate(
+            fields={'key': 'mykey', 'acl': 'public-read'},
+            conditions=[
+                {'bucket': 'mybucket'},
+                {'key': 'mykey'},
+                ['eq', '$acl', 'public-read'],
+                ['starts-with', '$Content-Type', 'image/'],
+                ['content-length-range', 1, 1024],
+            ],
+        )
+
+    def test_duplicate_equal_conditions_are_allowed(self):
+        self.validate(
+            fields={'acl': 'public-read'},
+            conditions=[{'acl': 'public-read'}, ['eq', '$acl', 'public-read']],
+        )
+
+    def test_conflicting_eq_conditions(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={},
+                conditions=[{'acl': 'private'}, ['eq', '$acl', 'public-read']],
+            )
+
+    def test_eq_value_must_satisfy_starts_with(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={},
+                conditions=[
+                    {'key': 'mykey'},
+                    ['starts-with', '$key', 'other'],
+                ],
+            )
+
+    def test_eq_value_satisfying_starts_with_is_allowed(self):
+        self.validate(
+            fields={'key': 'mykey'},
+            conditions=[{'key': 'mykey'}, ['starts-with', '$key', 'my']],
+        )
+
+    def test_incompatible_starts_with_prefixes(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={},
+                conditions=[
+                    ['starts-with', '$key', 'abc'],
+                    ['starts-with', '$key', 'abd'],
+                ],
+            )
+
+    def test_compatible_starts_with_prefixes(self):
+        self.validate(
+            fields={'key': 'abcdef'},
+            conditions=[
+                ['starts-with', '$key', 'abc'],
+                ['starts-with', '$key', 'abcdef'],
+            ],
+        )
+
+    def test_content_length_range_lower_exceeds_upper(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={}, conditions=[['content-length-range', 5, 2]]
+            )
+
+    def test_content_length_ranges_must_overlap(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={},
+                conditions=[
+                    ['content-length-range', 1, 5],
+                    ['content-length-range', 10, 20],
+                ],
+            )
+
+    def test_content_length_ranges_overlapping(self):
+        self.validate(
+            fields={},
+            conditions=[
+                ['content-length-range', 1, 10],
+                ['content-length-range', 5, 20],
+            ],
+        )
+
+    def test_unknown_condition_operator(self):
+        with self.assertRaises(PresignedPostUnknownConditionError):
+            self.validate(fields={}, conditions=[['not-an-op', '$key', 'v']])
+
+    def test_malformed_condition(self):
+        with self.assertRaises(PresignedPostUnknownConditionError):
+            self.validate(fields={}, conditions=[['eq', '$key']])
+
+    def test_non_structured_condition(self):
+        with self.assertRaises(PresignedPostUnknownConditionError):
+            self.validate(fields={}, conditions=['key'])
+
+    def test_field_without_condition(self):
+        with self.assertRaises(PresignedPostMissingConditionError):
+            self.validate(fields={'acl': 'public-read'}, conditions=[])
+
+    def test_exempt_fields_need_no_condition(self):
+        self.validate(
+            fields={
+                'policy': 'policy',
+                'signature': 'signature',
+                'x-amz-signature': 'signature',
+                'AWSAccessKeyId': 'accesskey',
+                'file': 'contents',
+                'x-ignore-anything': 'ignored',
+            },
+            conditions=[],
+        )
+
+    def test_field_value_violates_eq_condition(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={'acl': 'private'},
+                conditions=[{'acl': 'public-read'}],
+            )
+
+    def test_field_value_violates_starts_with_condition(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.validate(
+                fields={'key': 'mykey'},
+                conditions=[['starts-with', '$key', 'other']],
+            )
+
+    def test_filename_placeholder_key_is_not_checked_literally(self):
+        # The ${filename} suffix is substituted at upload time, so the
+        # literal field value must not be compared against conditions.
+        self.validate(
+            fields={'key': 'myprefix/${filename}'},
+            conditions=[['starts-with', '$key', 'myprefix/a']],
+        )
+
+    def test_filename_placeholder_key_with_eq_condition(self):
+        self.validate(
+            fields={'key': 'myprefix/${filename}'},
+            conditions=[
+                {'key': 'myprefix/a.txt'},
+                ['starts-with', '$key', 'myprefix/'],
+            ],
+        )
+
+    def test_sensitive_field_values_are_redacted(self):
+        with self.assertRaises(PresignedPostContradictionError) as cm:
+            self.validate(
+                fields={},
+                conditions=[
+                    {'x-amz-credential': 'real-credential-value'},
+                    {'x-amz-credential': 'other-credential-value'},
+                ],
+            )
+        message = str(cm.exception)
+        self.assertNotIn('real-credential-value', message)
+        self.assertNotIn('other-credential-value', message)
+        self.assertIn('<redacted>', message)
+
+
+class TestGeneratePresignedPostPolicyValidation(unittest.TestCase):
+    def setUp(self):
+        self.session = botocore.session.get_session()
+        self.client = self.session.create_client(
+            's3',
+            region_name='us-east-1',
+            aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
+            aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        )
+        self.datetime_patch = mock.patch('botocore.compat.datetime')
+        self.datetime_mock = self.datetime_patch.start()
+        self.fixed_date = datetime.datetime(2014, 3, 10, 17, 2, 55, 0)
+        self.datetime_mock.datetime.now.return_value = self.fixed_date
+
+    def tearDown(self):
+        self.datetime_patch.stop()
+
+    def presign_kwargs(self):
+        return {
+            'Bucket': 'mybucket',
+            'Key': 'mykey',
+            'Fields': {'acl': 'public-read'},
+            'Conditions': [
+                {'acl': 'public-read'},
+                ['starts-with', '$Content-Type', ''],
+                ['content-length-range', 1, 1024],
+            ],
+        }
+
+    def test_valid_policy_signature_unchanged(self):
+        expected = self.client.generate_presigned_post(**self.presign_kwargs())
+        actual = self.client.generate_presigned_post(
+            ValidatePolicy=True, **self.presign_kwargs()
+        )
+        self.assertEqual(actual, expected)
+
+    def test_valid_policy_signature_unchanged_sigv4(self):
+        client = self.session.create_client(
+            's3',
+            region_name='us-east-1',
+            aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
+            aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+            config=Config(signature_version='s3v4'),
+        )
+        expected = client.generate_presigned_post(**self.presign_kwargs())
+        actual = client.generate_presigned_post(
+            ValidatePolicy=True, **self.presign_kwargs()
+        )
+        self.assertEqual(actual, expected)
+
+    def test_filename_placeholder_signature_unchanged(self):
+        expected = self.client.generate_presigned_post(
+            Bucket='mybucket', Key='myprefix/${filename}'
+        )
+        actual = self.client.generate_presigned_post(
+            Bucket='mybucket',
+            Key='myprefix/${filename}',
+            ValidatePolicy=True,
+        )
+        self.assertEqual(actual, expected)
+
+    def test_conflicting_bucket_condition(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.client.generate_presigned_post(
+                Bucket='mybucket',
+                Key='mykey',
+                Conditions=[{'bucket': 'otherbucket'}],
+                ValidatePolicy=True,
+            )
+
+    def test_conflicting_key_condition(self):
+        with self.assertRaises(PresignedPostContradictionError):
+            self.client.generate_presigned_post(
+                Bucket='mybucket',
+                Key='mykey',
+                Conditions=[['starts-with', '$key', 'other']],
+                ValidatePolicy=True,
+            )
+
+    def test_conflicting_auth_condition(self):
+        client = self.session.create_client(
+            's3',
+            region_name='us-east-1',
+            aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
+            aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+            config=Config(signature_version='s3v4'),
+        )
+        with self.assertRaises(PresignedPostContradictionError) as cm:
+            client.generate_presigned_post(
+                Bucket='mybucket',
+                Key='mykey',
+                Conditions=[{'x-amz-credential': 'bogus-credential'}],
+                ValidatePolicy=True,
+            )
+        message = str(cm.exception)
+        self.assertNotIn('AKIAIOSFODNN7EXAMPLE', message)
+        self.assertNotIn('bogus-credential', message)
+
+    def test_missing_field_condition(self):
+        with self.assertRaises(PresignedPostMissingConditionError):
+            self.client.generate_presigned_post(
+                Bucket='mybucket',
+                Key='mykey',
+                Fields={'acl': 'public-read'},
+                ValidatePolicy=True,
+            )
+
+    def test_unknown_condition_type(self):
+        with self.assertRaises(PresignedPostUnknownConditionError):
+            self.client.generate_presigned_post(
+                Bucket='mybucket',
+                Key='mykey',
+                Conditions=[['not-a-condition', '$key', 'mykey']],
+                ValidatePolicy=True,
+            )
+
+    def test_validation_is_optional(self):
+        # Without ValidatePolicy, contradictory conditions still produce
+        # a signed result exactly as before.
+        result = self.client.generate_presigned_post(
+            Bucket='mybucket',
+            Key='mykey',
+            Conditions=[{'bucket': 'otherbucket'}],
+        )
+        self.assertIn('url', result)
+        self.assertIn('fields', result)
 
 
 class TestGenerateDBAuthToken(BaseSignerTest):

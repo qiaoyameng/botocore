@@ -520,6 +520,37 @@ class UnsupportedSignatureVersionError(BotoCoreError):
     fmt = 'Signature version(s) are not supported: {signature_version}'
 
 
+class PresignedPostPolicyError(BotoCoreError):
+    """Base error for S3 presigned POST policy validation failures."""
+
+    fmt = 'Invalid S3 presigned POST policy: {reason}'
+
+
+class PresignedPostMissingConditionError(PresignedPostPolicyError):
+    """A form field has no matching condition in the policy."""
+
+    fmt = (
+        'Field {field!r} is present in the S3 presigned POST fields but '
+        'has no matching condition in the policy; S3 will reject the '
+        'upload.'
+    )
+
+
+class PresignedPostUnknownConditionError(PresignedPostPolicyError):
+    """A policy condition uses an unsupported or malformed form."""
+
+    fmt = 'Unsupported S3 presigned POST policy condition: {condition}'
+
+
+class PresignedPostContradictionError(PresignedPostPolicyError):
+    """Policy conditions and/or fields contradict each other."""
+
+    fmt = (
+        'Conflicting S3 presigned POST policy constraints for field '
+        '{field!r}: {reason}'
+    )
+
+
 class ClientError(Exception):
     MSG_TEMPLATE = (
         'An error occurred ({error_code}) when calling the {operation_name} '

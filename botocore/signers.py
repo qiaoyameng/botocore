@@ -670,6 +670,7 @@ class S3PostPresigner:
         conditions=None,
         expires_in=3600,
         region_name=None,
+        validate_policy=False,
     ):
         """Generates the url and the form fields used for a presigned s3 post
 
@@ -699,6 +700,10 @@ class S3PostPresigner:
 
         :type region_name: string
         :param region_name: The region name to sign the presigned post to.
+
+        :type validate_policy: bool
+        :param validate_policy: Whether to locally validate that the fields
+            and conditions do not contradict each other before signing.
 
         :rtype: dict
         :returns: A dictionary with two elements: ``url`` and ``fields``.
@@ -741,6 +746,8 @@ class S3PostPresigner:
         request = create_request_object(request_dict)
         request.context['s3-presign-post-fields'] = fields
         request.context['s3-presign-post-policy'] = policy
+        if validate_policy:
+            request.context['s3-presign-post-validate-policy'] = True
 
         self._request_signer.sign(
             'PutObject', request, region_name, 'presign-post'
@@ -848,7 +855,13 @@ def add_generate_presigned_post(class_attributes, **kwargs):
 
 
 def generate_presigned_post(
-    self, Bucket, Key, Fields=None, Conditions=None, ExpiresIn=3600
+    self,
+    Bucket,
+    Key,
+    Fields=None,
+    Conditions=None,
+    ExpiresIn=3600,
+    ValidatePolicy=False,
 ):
     """Builds the url and the form fields used for a presigned s3 post
 
@@ -901,6 +914,17 @@ def generate_presigned_post(
     :param ExpiresIn: The number of seconds the presigned post
         is valid for.
 
+    :type ValidatePolicy: bool
+    :param ValidatePolicy: When set to True, the fields and conditions are
+        validated locally before signing. Conditions of type ``eq``,
+        ``starts-with``, ``content-length-range`` and exact-match mappings
+        are intersected per field, and the automatically added bucket, key
+        and auth fields are checked against the supplied conditions. A
+        ``PresignedPostMissingConditionError``,
+        ``PresignedPostUnknownConditionError`` or
+        ``PresignedPostContradictionError`` is raised if the generated
+        fields would violate the policy. Validation is skipped by default.
+
     :rtype: dict
     :returns: A dictionary with two elements: ``url`` and ``fields``.
         Url is the url to post to. Fields is a dictionary filled with
@@ -924,6 +948,7 @@ def generate_presigned_post(
     fields = Fields
     conditions = Conditions
     expires_in = ExpiresIn
+    validate_policy = ValidatePolicy
 
     if fields is None:
         fields = {}
@@ -987,6 +1012,7 @@ def generate_presigned_post(
         fields=fields,
         conditions=conditions,
         expires_in=expires_in,
+        validate_policy=validate_policy,
     )
 
 
