@@ -1,0 +1,5 @@
+{
+  "type": "enhancement",
+  "category": "Paginator",
+  "description": "Add a configurable token cycle detection window to paginators. If a service returns a pagination token identical to one seen within the recent window (for example A -> B -> A), a ``PaginationError`` is raised instead of paginating forever. The window defaults to 10 tokens, is bounded in memory, and can be tuned or disabled with the ``TokenCycleWindowSize`` member of ``PaginationConfig``."
+}

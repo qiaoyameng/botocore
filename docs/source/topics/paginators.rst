@@ -69,6 +69,24 @@ pagination::
         ``PageSize`` argument depending on the service, the operation, or the
         resource you are paginating.
 
+``TokenCycleWindowSize``
+    Controls how many recent service-provided pagination tokens are kept to
+    detect server-side token cycles. Some services occasionally enter a loop
+    and return a token that was already returned earlier (for example
+    ``A -> B -> A``). If a token repeats within this window, a
+    ``botocore.exceptions.PaginationError`` is raised instead of paginating
+    forever. The comparison uses the complete, possibly multi-field service
+    token and distinguishes a missing field from an empty string or an
+    explicit null. The error reports the cycle span and request counts but
+    never the token contents. Defaults to ``10`` and memory usage is bounded
+    by the window size. Set to ``0`` to disable cycle detection.
+
+    .. note::
+
+        Resume markers generated client-side when ``MaxItems`` truncates a
+        page are not service tokens and are never treated as a cycle, so
+        resuming pagination mid-page is safe.
+
 
 Filtering results
 -----------------

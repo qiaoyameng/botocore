@@ -14,8 +14,10 @@
 from botocore import model
 from botocore.exceptions import PaginationError
 from botocore.paginate import (
+    DEFAULT_TOKEN_CYCLE_WINDOW_SIZE,
     Paginator,
     PaginatorModel,
+    TokenCycleDetector,
     TokenDecoder,
     TokenEncoder,
 )
@@ -787,6 +789,223 @@ class TestOptionalTokens(unittest.TestCase):
                 ),
             ],
         )
+
+
+class TestTokenCycleDetector(unittest.TestCase):
+    def test_fingerprint_distinguishes_missing_empty_and_none(self):
+        detector = TokenCycleDetector(['Key', 'Id'], 10)
+        fingerprints = {
+            detector.fingerprint({'Key': 'A'}),
+            detector.fingerprint({'Key': 'A', 'Id': None}),
+            detector.fingerprint({'Key': 'A', 'Id': ''}),
+            detector.fingerprint({'Key': 'A', 'Id': 'X'}),
+        }
+        self.assertEqual(len(fingerprints), 4)
+
+    def test_old_tokens_are_evicted_from_window(self):
+        detector = TokenCycleDetector(['NextToken'], 2)
+        detector.check_and_record({'NextToken': 'A'}, 1)
+        detector.check_and_record({'NextToken': 'B'}, 2)
+        detector.check_and_record({'NextToken': 'C'}, 3)
+        # 'A' fell out of the window, so seeing it again is not a cycle.
+        detector.check_and_record({'NextToken': 'A'}, 4)
+        # 'C' is still within the window and is flagged as a cycle.
+        with self.assertRaises(PaginationError):
+            detector.check_and_record({'NextToken': 'C'}, 5)
+
+    def test_window_memory_is_bounded(self):
+        detector = TokenCycleDetector(['NextToken'], 3)
+        for i in range(100):
+            detector.check_and_record({'NextToken': f'token-{i}'}, i + 1)
+        self.assertLessEqual(len(detector._window), 3)
+        self.assertLessEqual(len(detector._positions), 3)
+
+    def test_disabled_detector_never_raises(self):
+        detector = TokenCycleDetector(['NextToken'], 0)
+        detector.check_and_record({'NextToken': 'A'}, 1)
+        detector.check_and_record({'NextToken': 'A'}, 2)
+        self.assertEqual(len(detector._window), 0)
+
+    def test_error_message_has_span_and_counts_but_not_token(self):
+        detector = TokenCycleDetector(['NextToken'], 10)
+        detector.check_and_record({'NextToken': 'SECRET_TOKEN'}, 1)
+        detector.check_and_record({'NextToken': 'OTHER'}, 2)
+        with self.assertRaises(PaginationError) as cm:
+            detector.check_and_record({'NextToken': 'SECRET_TOKEN'}, 3)
+        message = str(cm.exception)
+        self.assertIn('2 request(s) earlier', message)
+        self.assertIn('request 1', message)
+        self.assertIn('request 3', message)
+        self.assertNotIn('SECRET_TOKEN', message)
+        self.assertNotIn('OTHER', message)
+
+
+class TestTokenCycleDetection(unittest.TestCase):
+    def setUp(self):
+        self.method = mock.Mock()
+        self.model = mock.Mock()
+        self.paginate_config = {
+            'output_token': 'NextToken',
+            'input_token': 'NextToken',
+            'result_key': 'Foo',
+        }
+        self.paginator = Paginator(
+            self.method, self.paginate_config, self.model
+        )
+
+    def test_non_adjacent_cycle_detected(self):
+        # A -> B -> A would paginate forever when only adjacent tokens
+        # are compared.
+        responses = [
+            {'Foo': [1], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [2], 'NextToken': 'TOKEN_BETA'},
+            {'Foo': [3], 'NextToken': 'TOKEN_ALPHA'},
+        ]
+        self.method.side_effect = responses
+        with self.assertRaises(PaginationError) as cm:
+            list(self.paginator.paginate())
+        message = str(cm.exception)
+        # The cycle spans two requests (request 1 -> request 3).
+        self.assertIn('2 request(s) earlier', message)
+        self.assertIn('request 1', message)
+        self.assertIn('request 3', message)
+        # The token contents are never included in the error.
+        self.assertNotIn('TOKEN_ALPHA', message)
+        self.assertNotIn('TOKEN_BETA', message)
+        self.assertEqual(self.method.call_count, 3)
+
+    def test_adjacent_cycle_still_detected(self):
+        responses = [
+            {'Foo': [1], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [2], 'NextToken': 'TOKEN_ALPHA'},
+        ]
+        self.method.side_effect = responses
+        with self.assertRaises(PaginationError):
+            list(self.paginator.paginate())
+
+    def test_default_window_size_is_used(self):
+        pages = self.paginator.paginate()
+        self.assertEqual(
+            pages._token_cycle_detector._window_size,
+            DEFAULT_TOKEN_CYCLE_WINDOW_SIZE,
+        )
+
+    def test_default_window_detects_longer_cycles(self):
+        # A cycle with a span of 5 is still caught by the default window.
+        responses = [
+            {'Foo': [i], 'NextToken': f'TOKEN_{i}'} for i in range(5)
+        ]
+        responses.append({'Foo': [5], 'NextToken': 'TOKEN_0'})
+        self.method.side_effect = responses
+        with self.assertRaises(PaginationError):
+            list(self.paginator.paginate())
+
+    def test_cycle_outside_window_not_detected(self):
+        responses = [
+            {'Foo': [1], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [2], 'NextToken': 'TOKEN_BETA'},
+            {'Foo': [3], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [4], 'NextToken': 'TOKEN_BETA'},
+            {'Foo': [5]},
+        ]
+        self.method.side_effect = responses
+        pages = self.paginator.paginate(
+            PaginationConfig={'TokenCycleWindowSize': 1}
+        )
+        self.assertEqual(len(list(pages)), 5)
+
+    def test_cycle_detection_disabled(self):
+        responses = [
+            {'Foo': [1], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [2], 'NextToken': 'TOKEN_ALPHA'},
+            {'Foo': [3]},
+        ]
+        self.method.side_effect = responses
+        pages = self.paginator.paginate(
+            PaginationConfig={'TokenCycleWindowSize': 0}
+        )
+        self.assertEqual(len(list(pages)), 3)
+
+
+class TestCompositeTokenCycleDetection(unittest.TestCase):
+    def setUp(self):
+        self.method = mock.Mock()
+        self.model = mock.Mock()
+        self.paginate_config = {
+            'output_token': ['NextKey', 'NextId'],
+            'input_token': ['Key', 'Id'],
+            'result_key': 'Foo',
+        }
+        self.paginator = Paginator(
+            self.method, self.paginate_config, self.model
+        )
+
+    def test_distinct_composite_tokens_are_not_a_cycle(self):
+        # The tokens share the NextKey field but the complete composite
+        # token differs each time.  A missing field, an empty string and
+        # an explicit None are all distinct token states.
+        responses = [
+            {'Foo': [1], 'NextKey': 'KEY_A', 'NextId': 'ID_X'},
+            {'Foo': [2], 'NextKey': 'KEY_A', 'NextId': 'ID_Y'},
+            {'Foo': [3], 'NextKey': 'KEY_A', 'NextId': ''},
+            {'Foo': [4], 'NextKey': 'KEY_A'},
+            {'Foo': [5], 'NextKey': 'KEY_A', 'NextId': None},
+            {'Foo': [6]},
+        ]
+        self.method.side_effect = responses
+        self.assertEqual(len(list(self.paginator.paginate())), 6)
+
+    def test_repeated_composite_token_is_a_cycle(self):
+        responses = [
+            {'Foo': [1], 'NextKey': 'KEY_A', 'NextId': 'ID_X'},
+            {'Foo': [2], 'NextKey': 'KEY_B', 'NextId': 'ID_Y'},
+            {'Foo': [3], 'NextKey': 'KEY_A', 'NextId': 'ID_X'},
+        ]
+        self.method.side_effect = responses
+        with self.assertRaises(PaginationError) as cm:
+            list(self.paginator.paginate())
+        self.assertIn('2 request(s) earlier', str(cm.exception))
+
+
+class TestInPageResumeWithCycleDetection(unittest.TestCase):
+    def setUp(self):
+        self.method = mock.Mock()
+        self.model = mock.Mock()
+        self.paginate_config = {
+            'output_token': 'NextToken',
+            'input_token': 'NextToken',
+            'result_key': 'Foo',
+        }
+        self.paginator = Paginator(
+            self.method, self.paginate_config, self.model
+        )
+
+    def test_max_items_resume_not_flagged_as_cycle(self):
+        # The first session truncates mid-page because of MaxItems.  The
+        # resulting resume token is generated client-side and must not
+        # be treated as a service-side cycle when pagination resumes.
+        first_responses = [
+            {'Foo': ['i1', 'i2', 'i3', 'i4'], 'NextToken': 'TOKEN_A'},
+            {'Foo': ['i5', 'i6', 'i7', 'i8'], 'NextToken': 'TOKEN_B'},
+        ]
+        self.method.side_effect = first_responses
+        pages = self.paginator.paginate(PaginationConfig={'MaxItems': 5})
+        result = pages.build_full_result()
+        self.assertEqual(result['Foo'], ['i1', 'i2', 'i3', 'i4', 'i5'])
+        resume_token = result['NextToken']
+
+        # Resuming mid-page legitimately re-requests the truncated page,
+        # so the service returns the same tokens again.
+        second_responses = [
+            {'Foo': ['i5', 'i6', 'i7', 'i8'], 'NextToken': 'TOKEN_B'},
+            {'Foo': ['i9']},
+        ]
+        self.method.side_effect = second_responses
+        pages = self.paginator.paginate(
+            PaginationConfig={'StartingToken': resume_token}
+        )
+        result = pages.build_full_result()
+        self.assertEqual(result['Foo'], ['i6', 'i7', 'i8', 'i9'])
 
 
 class TestKeyIterators(unittest.TestCase):

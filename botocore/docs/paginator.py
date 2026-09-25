@@ -178,6 +178,20 @@ def document_paginate_method(
         ),
     )
 
+    pagination_config_members['TokenCycleWindowSize'] = DocumentedShape(
+        name='TokenCycleWindowSize',
+        type_name='integer',
+        documentation=(
+            '<p>The number of recent service pagination tokens to keep '
+            'for detecting server-side token cycles. If the service '
+            'returns a token identical to one seen within this window, '
+            'a <code>PaginationError</code> is raised instead of '
+            'looping forever. Defaults to 10. Memory usage is bounded '
+            'by the window size. Set to 0 to disable cycle '
+            'detection.</p>'
+        ),
+    )
+
     botocore_pagination_params = [
         DocumentedShape(
             name='PaginationConfig',
