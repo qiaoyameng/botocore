@@ -484,6 +484,28 @@ class WaiterError(BotoCoreError):
         self.last_response = last_response
 
 
+class WaiterPaused(WaiterError):
+    """Waiter paused before reaching a terminal state.
+
+    :ivar state: A JSON document capturing the paused waiter state.  It can
+        be passed to a subsequent ``wait`` call (potentially on a new waiter
+        instance) via the ``ResumeFrom`` argument to continue waiting where
+        this invocation left off.
+    """
+
+    fmt = 'Waiter {name} paused: {reason}'
+
+    def __init__(self, name, reason, last_response, state):
+        super().__init__(name=name, reason=reason, last_response=last_response)
+        self.state = state
+
+
+class WaiterStateError(BotoCoreError):
+    """Error when resuming a waiter from a saved state."""
+
+    fmt = 'Error resuming waiter {name}: {reason}'
+
+
 class IncompleteReadError(BotoCoreError):
     """HTTP response did not return expected number of bytes."""
 

@@ -10,6 +10,8 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import hashlib
+import json
 import logging
 import time
 from functools import partial
@@ -22,12 +24,33 @@ from botocore.useragent import register_feature_id
 from botocore.utils import get_service_module_name
 
 from . import xform_name
-from .exceptions import ClientError, WaiterConfigError, WaiterError
+from .exceptions import (
+    ClientError,
+    WaiterConfigError,
+    WaiterError,
+    WaiterPaused,
+    WaiterStateError,
+)
 
 logger = logging.getLogger(__name__)
 
+_WAITER_STATE_VERSION = 1
 
-def create_waiter_with_client(waiter_name, waiter_model, client):
+
+class _SystemClock:
+    """Default clock used by waiters, backed by the ``time`` module."""
+
+    def time(self):
+        return time.time()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
+_SYSTEM_CLOCK = _SystemClock()
+
+
+def create_waiter_with_client(waiter_name, waiter_model, client, clock=None):
     """
 
     :type waiter_name: str
@@ -40,6 +63,12 @@ def create_waiter_with_client(waiter_name, waiter_model, client):
 
     :type client: botocore.client.BaseClient
     :param client: The botocore client associated with the service.
+
+    :type clock: object
+    :param clock: An optional clock object providing ``time()`` and
+        ``sleep(seconds)`` methods.  This is primarily useful for testing
+        and for resumable waits that need a deterministic view of time.
+        Defaults to a clock backed by the ``time`` module.
 
     :rtype: botocore.waiter.Waiter
     :return: The waiter object.
@@ -75,7 +104,7 @@ def create_waiter_with_client(waiter_name, waiter_model, client):
 
     # Return an instance of the new waiter class.
     return documented_waiter_cls(
-        waiter_name, single_waiter_config, operation_method
+        waiter_name, single_waiter_config, operation_method, clock=clock
     )
 
 
@@ -313,7 +342,7 @@ class AcceptorConfig:
 
 
 class Waiter:
-    def __init__(self, name, config, operation_method):
+    def __init__(self, name, config, operation_method, clock=None):
         """
 
         :type name: string
@@ -327,8 +356,14 @@ class Waiter:
             and returns a response.  For example, this can be
             a method from a botocore client.
 
+        :type clock: object
+        :param clock: An optional clock object providing ``time()`` and
+            ``sleep(seconds)`` methods.  Defaults to a clock backed by
+            the ``time`` module.
+
         """
         self._operation_method = operation_method
+        self._clock = clock if clock is not None else _SYSTEM_CLOCK
         # The two attributes are exposed to allow for introspection
         # and documentation.
         self.name = name
@@ -342,15 +377,41 @@ class Waiter:
         config = kwargs.pop('WaiterConfig', {})
         sleep_amount = config.get('Delay', self.config.delay)
         max_attempts = config.get('MaxAttempts', self.config.max_attempts)
-        last_matched_acceptor = None
+        # Pop the resumable waiting controls.  ``MaxPolls`` bounds how many
+        # requests this invocation may make before pausing with a JSON state
+        # token, and ``ResumeFrom`` continues a previously paused wait.
+        # Neither is passed through to the underlying operation.
+        max_polls = kwargs.pop('MaxPolls', None)
+        resume_from = kwargs.pop('ResumeFrom', None)
+        fingerprint = self._fingerprint(kwargs, sleep_amount, max_attempts)
+        has_matched_acceptor = False
+        last_acceptor_explanation = None
         num_attempts = 0
+        if resume_from is not None:
+            state = self._load_resume_state(
+                resume_from, fingerprint, max_attempts
+            )
+            num_attempts = state['attempts']
+            last_acceptor_explanation = state.get('last_acceptor')
+            has_matched_acceptor = last_acceptor_explanation is not None
+            self._sleep_until(state['next_poll_at'])
 
+        polls_this_call = 0
         while True:
+            if max_polls is not None and polls_this_call >= max_polls:
+                self._pause(
+                    num_attempts=num_attempts,
+                    next_poll_at=self._clock.time(),
+                    last_acceptor_explanation=last_acceptor_explanation,
+                    fingerprint=fingerprint,
+                    last_response=None,
+                )
             response = self._operation_method(**kwargs)
             num_attempts += 1
+            polls_this_call += 1
             for acceptor in acceptors:
                 if acceptor.matcher_func(response):
-                    last_matched_acceptor = acceptor
+                    has_matched_acceptor = True
                     current_state = acceptor.state
                     break
             else:
@@ -368,6 +429,8 @@ class Waiter:
                         ),
                         last_response=response,
                     )
+            if acceptors:
+                last_acceptor_explanation = acceptor.explanation
             if current_state == 'success':
                 logger.debug(
                     "Waiting complete, waiter matched the success state."
@@ -381,16 +444,124 @@ class Waiter:
                     last_response=response,
                 )
             if num_attempts >= max_attempts:
-                if last_matched_acceptor is None:
+                if not has_matched_acceptor:
                     reason = 'Max attempts exceeded'
                 else:
                     reason = (
                         f'Max attempts exceeded. Previously accepted state: '
-                        f'{acceptor.explanation}'
+                        f'{last_acceptor_explanation}'
                     )
                 raise WaiterError(
                     name=self.name,
                     reason=reason,
                     last_response=response,
                 )
-            time.sleep(sleep_amount)
+            if max_polls is not None and polls_this_call >= max_polls:
+                self._pause(
+                    num_attempts=num_attempts,
+                    next_poll_at=self._clock.time() + sleep_amount,
+                    last_acceptor_explanation=last_acceptor_explanation,
+                    fingerprint=fingerprint,
+                    last_response=response,
+                )
+            self._clock.sleep(sleep_amount)
+
+    def _fingerprint(self, params, sleep_amount, max_attempts):
+        # The fingerprint ties a saved state to the exact waiter definition
+        # (including its acceptors) and the request parameters it was
+        # created with.  Only the hash is ever persisted, so the saved
+        # state never contains request parameters or credentials.
+        payload = {
+            'waiter': self.name,
+            'config': self.config._config,
+            'delay': sleep_amount,
+            'max_attempts': max_attempts,
+            'params': params,
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(',', ':'), default=repr
+        )
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    def _pause(
+        self,
+        num_attempts,
+        next_poll_at,
+        last_acceptor_explanation,
+        fingerprint,
+        last_response,
+    ):
+        # The saved state is intentionally small: it records progress and
+        # timing only, never responses or request parameters.
+        state = {
+            'version': _WAITER_STATE_VERSION,
+            'waiter': self.name,
+            'state': 'waiting',
+            'attempts': num_attempts,
+            'next_poll_at': next_poll_at,
+            'fingerprint': fingerprint,
+            'last_acceptor': last_acceptor_explanation,
+        }
+        raise WaiterPaused(
+            name=self.name,
+            reason='Waiter paused before reaching a terminal state.',
+            last_response=last_response,
+            state=json.dumps(state, sort_keys=True),
+        )
+
+    def _load_resume_state(self, token, fingerprint, max_attempts):
+        try:
+            state = json.loads(token)
+        except (TypeError, ValueError):
+            raise WaiterStateError(
+                name=self.name, reason='Resume state is not valid JSON.'
+            )
+        if (
+            not isinstance(state, dict)
+            or state.get('version') != _WAITER_STATE_VERSION
+        ):
+            raise WaiterStateError(
+                name=self.name,
+                reason='Resume state has an unsupported version.',
+            )
+        if state.get('state') != 'waiting':
+            raise WaiterStateError(
+                name=self.name,
+                reason='Only a waiter paused in a non-terminal state '
+                'can be resumed.',
+            )
+        if state.get('fingerprint') != fingerprint:
+            raise WaiterStateError(
+                name=self.name,
+                reason='Waiter definition or request parameters changed '
+                'since the state was saved.',
+            )
+        attempts = state.get('attempts')
+        next_poll_at = state.get('next_poll_at')
+        if (
+            not isinstance(attempts, int)
+            or attempts < 0
+            or not isinstance(next_poll_at, (int, float))
+        ):
+            raise WaiterStateError(
+                name=self.name,
+                reason='Resume state is missing required fields.',
+            )
+        if attempts >= max_attempts:
+            # A state that has already exhausted the original MaxAttempts
+            # budget must not issue further requests.
+            reason = 'Max attempts exceeded'
+            if state.get('last_acceptor') is not None:
+                reason = (
+                    'Max attempts exceeded. Previously accepted state: '
+                    f"{state['last_acceptor']}"
+                )
+            raise WaiterError(
+                name=self.name, reason=reason, last_response=None
+            )
+        return state
+
+    def _sleep_until(self, next_poll_at):
+        remaining = next_poll_at - self._clock.time()
+        if remaining > 0:
+            self._clock.sleep(remaining)

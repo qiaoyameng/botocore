@@ -11,12 +11,22 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import io
+import json
 import os
 
 import botocore
-from botocore.exceptions import ClientError, WaiterConfigError, WaiterError
+import botocore.config
+import botocore.session
+from botocore.exceptions import (
+    ClientError,
+    WaiterConfigError,
+    WaiterError,
+    WaiterPaused,
+    WaiterStateError,
+)
 from botocore.loaders import Loader
 from botocore.model import ServiceModel
+from botocore.stub import Stubber
 from botocore.waiter import (
     NormalizedOperationMethod,
     SingleWaiterConfig,
@@ -814,6 +824,409 @@ class TestCreateWaiter(unittest.TestCase):
         ]
         for line in lines:
             self.assertIn(line, content)
+
+
+class FakeClock:
+    """A deterministic clock for testing resumable waiters."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+        self.sleeps = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class TestResumableWaiter(unittest.TestCase):
+    def create_waiter_config(
+        self, delay=5, max_attempts=5, acceptors=None, operation='MyOperation'
+    ):
+        if acceptors is None:
+            acceptors = [
+                {
+                    'state': 'success',
+                    'matcher': 'path',
+                    'argument': 'Foo',
+                    'expected': 'SUCCESS',
+                },
+                {
+                    'state': 'retry',
+                    'matcher': 'path',
+                    'argument': 'Foo',
+                    'expected': 'RETRY',
+                },
+            ]
+        return SingleWaiterConfig(
+            {
+                'operation': operation,
+                'delay': delay,
+                'maxAttempts': max_attempts,
+                'acceptors': acceptors,
+            }
+        )
+
+    def create_paused_state(self, responses=('RETRY',), **wait_kwargs):
+        config = wait_kwargs.pop('config', self.create_waiter_config())
+        clock = wait_kwargs.pop('clock', FakeClock())
+        operation_method = mock.Mock()
+        operation_method.side_effect = [
+            {'Foo': value} for value in responses
+        ]
+        waiter = Waiter('MyWaiter', config, operation_method, clock=clock)
+        wait_kwargs.setdefault('MaxPolls', len(responses))
+        with self.assertRaises(WaiterPaused) as e:
+            waiter.wait(**wait_kwargs)
+        return e.exception.state, operation_method, clock
+
+    def test_pause_provides_json_state(self):
+        clock = FakeClock()
+        token, operation_method, _ = self.create_paused_state(
+            responses=('RETRY', 'RETRY'), clock=clock
+        )
+        state = json.loads(token)
+        self.assertEqual(
+            set(state),
+            {
+                'version',
+                'waiter',
+                'state',
+                'attempts',
+                'next_poll_at',
+                'fingerprint',
+                'last_acceptor',
+            },
+        )
+        self.assertEqual(state['waiter'], 'MyWaiter')
+        self.assertEqual(state['state'], 'waiting')
+        self.assertEqual(state['attempts'], 2)
+        # One sleep happened after the first poll; the second poll's
+        # delay is captured as the next allowed poll time instead.
+        self.assertEqual(clock.sleeps, [5])
+        self.assertEqual(state['next_poll_at'], 1010.0)
+        self.assertEqual(operation_method.call_count, 2)
+
+    def test_state_contains_no_params_or_response_content(self):
+        config = self.create_waiter_config()
+        clock = FakeClock()
+        operation_method = mock.Mock()
+        operation_method.side_effect = [
+            {'Foo': 'RETRY', 'Sensitive': 'response-secret'}
+        ]
+        waiter = Waiter('MyWaiter', config, operation_method, clock=clock)
+        with self.assertRaises(WaiterPaused) as e:
+            waiter.wait(MaxPolls=1, Credentials='request-secret')
+        token = e.exception.state
+        self.assertNotIn('response-secret', token)
+        self.assertNotIn('request-secret', token)
+        self.assertNotIn('Credentials', token)
+
+    def test_resume_continues_where_previous_call_left_off(self):
+        token, _, first_clock = self.create_paused_state(
+            responses=('RETRY', 'RETRY')
+        )
+        # A brand new waiter instance resumes from the saved state.
+        second_clock = FakeClock(now=first_clock.now)
+        operation_method = mock.Mock()
+        operation_method.side_effect = [{'Foo': 'SUCCESS'}]
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(),
+            operation_method,
+            clock=second_clock,
+        )
+        waiter.wait(ResumeFrom=token)
+        self.assertEqual(operation_method.call_count, 1)
+        # The remaining delay from the first call is slept before polling.
+        self.assertEqual(second_clock.sleeps, [5])
+
+    def test_resume_refuses_changed_params(self):
+        token, operation_method, _ = self.create_paused_state(Bucket='a')
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(),
+            operation_method,
+            clock=FakeClock(),
+        )
+        with self.assertRaises(WaiterStateError):
+            waiter.wait(Bucket='b', ResumeFrom=token)
+        # No additional requests are made.
+        self.assertEqual(operation_method.call_count, 1)
+
+    def test_resume_refuses_changed_acceptor_definitions(self):
+        token, operation_method, _ = self.create_paused_state()
+        changed_config = self.create_waiter_config(
+            acceptors=[
+                {
+                    'state': 'success',
+                    'matcher': 'path',
+                    'argument': 'Foo',
+                    'expected': 'CHANGED',
+                }
+            ]
+        )
+        waiter = Waiter(
+            'MyWaiter', changed_config, operation_method, clock=FakeClock()
+        )
+        with self.assertRaises(WaiterStateError):
+            waiter.wait(ResumeFrom=token)
+        self.assertEqual(operation_method.call_count, 1)
+
+    def test_resume_refuses_changed_waiter_config(self):
+        token, operation_method, _ = self.create_paused_state()
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(),
+            operation_method,
+            clock=FakeClock(),
+        )
+        with self.assertRaises(WaiterStateError):
+            waiter.wait(
+                ResumeFrom=token, WaiterConfig={'Delay': 9, 'MaxAttempts': 5}
+            )
+        self.assertEqual(operation_method.call_count, 1)
+
+    def test_resume_rejects_malformed_state(self):
+        operation_method = mock.Mock()
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(),
+            operation_method,
+            clock=FakeClock(),
+        )
+        bad_tokens = [
+            'not-json',
+            json.dumps(['not', 'a', 'dict']),
+            json.dumps({'version': 999}),
+            json.dumps(
+                {
+                    'version': 1,
+                    'state': 'waiting',
+                    'attempts': 'not-an-int',
+                    'next_poll_at': 0,
+                }
+            ),
+        ]
+        for token in bad_tokens:
+            with self.assertRaises(WaiterStateError):
+                waiter.wait(ResumeFrom=token)
+        operation_method.assert_not_called()
+
+    def test_resume_rejects_terminal_state(self):
+        token, operation_method, _ = self.create_paused_state()
+        state = json.loads(token)
+        state['state'] = 'success'
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(),
+            operation_method,
+            clock=FakeClock(),
+        )
+        with self.assertRaises(WaiterStateError):
+            waiter.wait(ResumeFrom=json.dumps(state))
+        self.assertEqual(operation_method.call_count, 1)
+
+    def test_resume_enforces_original_max_attempts(self):
+        token, operation_method, _ = self.create_paused_state(
+            config=self.create_waiter_config(max_attempts=2)
+        )
+        # A state that has already consumed the original MaxAttempts
+        # budget must raise without issuing another request.
+        state = json.loads(token)
+        state['attempts'] = 2
+        waiter = Waiter(
+            'MyWaiter',
+            self.create_waiter_config(max_attempts=2),
+            operation_method,
+            clock=FakeClock(),
+        )
+        with self.assertRaisesRegex(WaiterError, 'Max attempts exceeded'):
+            waiter.wait(ResumeFrom=json.dumps(state))
+        self.assertEqual(operation_method.call_count, 1)
+
+    def test_max_attempts_spans_pause_and_resume(self):
+        config = self.create_waiter_config(max_attempts=3)
+        token, _, first_clock = self.create_paused_state(
+            responses=('RETRY', 'RETRY'), config=config
+        )
+        operation_method = mock.Mock()
+        operation_method.side_effect = [{'Foo': 'RETRY'}]
+        waiter = Waiter(
+            'MyWaiter',
+            config,
+            operation_method,
+            clock=FakeClock(now=first_clock.now),
+        )
+        # The third (and final allowed) attempt is made by the resumed
+        # waiter, which then exhausts the original MaxAttempts budget.
+        with self.assertRaisesRegex(WaiterError, 'Max attempts exceeded'):
+            waiter.wait(ResumeFrom=token)
+        self.assertEqual(operation_method.call_count, 1)
+
+
+class TestResumableWaiterEquivalence(unittest.TestCase):
+    # Verify that a wait split across two waiter instances makes the same
+    # decisions as a single continuous wait, using a real client driven
+    # by a Stubber and an injected clock.
+
+    def setUp(self):
+        session = botocore.session.get_session()
+        config = botocore.config.Config(signature_version=botocore.UNSIGNED)
+        self.client = session.create_client(
+            's3', region_name='us-east-1', config=config
+        )
+        self.stubber = Stubber(self.client)
+        self.clock = FakeClock()
+
+    def create_waiter(self, max_attempts=5, delay=5):
+        waiter_model = WaiterModel(
+            {
+                'version': 2,
+                'waiters': {
+                    'ObjectReady': {
+                        'operation': 'ListObjects',
+                        'delay': delay,
+                        'maxAttempts': max_attempts,
+                        'acceptors': [
+                            {
+                                'state': 'success',
+                                'matcher': 'path',
+                                'argument': 'IsTruncated',
+                                'expected': False,
+                            },
+                            {
+                                'state': 'retry',
+                                'matcher': 'path',
+                                'argument': 'IsTruncated',
+                                'expected': True,
+                            },
+                            {
+                                'state': 'failure',
+                                'matcher': 'error',
+                                'expected': 'NoSuchBucket',
+                            },
+                        ],
+                    }
+                },
+            }
+        )
+        return create_waiter_with_client(
+            'ObjectReady', waiter_model, self.client, clock=self.clock
+        )
+
+    def add_pending_response(self):
+        self.stubber.add_response(
+            'list_objects',
+            {'IsTruncated': True},
+            expected_params={'Bucket': 'mybucket'},
+        )
+
+    def add_ready_response(self):
+        self.stubber.add_response(
+            'list_objects',
+            {'IsTruncated': False},
+            expected_params={'Bucket': 'mybucket'},
+        )
+
+    def test_success_matches_continuous_run(self):
+        # Continuous run: two retries then a success.
+        self.add_pending_response()
+        self.add_pending_response()
+        self.add_ready_response()
+        with self.stubber:
+            self.create_waiter().wait(Bucket='mybucket')
+        self.stubber.assert_no_pending_responses()
+        continuous_sleeps = list(self.clock.sleeps)
+
+        # Segmented run: pause after the first poll, resume on a new
+        # waiter instance, pause again, then resume to completion.
+        self.setUp()
+        self.add_pending_response()
+        self.add_pending_response()
+        self.add_ready_response()
+        with self.stubber:
+            with self.assertRaises(WaiterPaused) as first_pause:
+                self.create_waiter().wait(Bucket='mybucket', MaxPolls=1)
+            with self.assertRaises(WaiterPaused) as second_pause:
+                self.create_waiter().wait(
+                    Bucket='mybucket',
+                    MaxPolls=1,
+                    ResumeFrom=first_pause.exception.state,
+                )
+            self.create_waiter().wait(
+                Bucket='mybucket', ResumeFrom=second_pause.exception.state
+            )
+        self.stubber.assert_no_pending_responses()
+        self.assertEqual(self.clock.sleeps, continuous_sleeps)
+
+    def test_failure_matches_continuous_run(self):
+        # Continuous run: one retry then a terminal failure.
+        self.add_pending_response()
+        self.stubber.add_client_error(
+            'list_objects',
+            'NoSuchBucket',
+            expected_params={'Bucket': 'mybucket'},
+        )
+        with self.stubber:
+            with self.assertRaises(WaiterError) as continuous_error:
+                self.create_waiter().wait(Bucket='mybucket')
+        self.stubber.assert_no_pending_responses()
+        continuous_sleeps = list(self.clock.sleeps)
+
+        # Segmented run: pause after the first poll, then hit the same
+        # terminal failure on the resumed waiter.
+        self.setUp()
+        self.add_pending_response()
+        self.stubber.add_client_error(
+            'list_objects',
+            'NoSuchBucket',
+            expected_params={'Bucket': 'mybucket'},
+        )
+        with self.stubber:
+            with self.assertRaises(WaiterPaused) as pause:
+                self.create_waiter().wait(Bucket='mybucket', MaxPolls=1)
+            with self.assertRaises(WaiterError) as segmented_error:
+                self.create_waiter().wait(
+                    Bucket='mybucket', ResumeFrom=pause.exception.state
+                )
+        self.stubber.assert_no_pending_responses()
+        self.assertEqual(self.clock.sleeps, continuous_sleeps)
+        self.assertEqual(
+            str(segmented_error.exception), str(continuous_error.exception)
+        )
+
+    def test_max_attempts_exceeded_matches_continuous_run(self):
+        # Continuous run: three retries exhaust the max attempts.
+        for _ in range(3):
+            self.add_pending_response()
+        with self.stubber:
+            with self.assertRaises(WaiterError) as continuous_error:
+                self.create_waiter(max_attempts=3).wait(Bucket='mybucket')
+        self.stubber.assert_no_pending_responses()
+        continuous_sleeps = list(self.clock.sleeps)
+
+        # Segmented run: two polls in the first segment, the final
+        # allowed poll happens after resuming.
+        self.setUp()
+        for _ in range(3):
+            self.add_pending_response()
+        with self.stubber:
+            with self.assertRaises(WaiterPaused) as pause:
+                self.create_waiter(max_attempts=3).wait(
+                    Bucket='mybucket', MaxPolls=2
+                )
+            with self.assertRaises(WaiterError) as segmented_error:
+                self.create_waiter(max_attempts=3).wait(
+                    Bucket='mybucket', ResumeFrom=pause.exception.state
+                )
+        self.stubber.assert_no_pending_responses()
+        self.assertEqual(self.clock.sleeps, continuous_sleeps)
+        self.assertEqual(
+            str(segmented_error.exception), str(continuous_error.exception)
+        )
 
 
 class TestOperationMethods(unittest.TestCase):
