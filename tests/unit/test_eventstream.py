@@ -12,6 +12,8 @@
 # language governing permissions and limitations under the License.
 """Unit tests for the binary event stream decoder."""
 
+from binascii import crc32
+
 import pytest
 
 from botocore.eventstream import (
@@ -26,9 +28,10 @@ from botocore.eventstream import (
     InvalidPayloadLength,
     MessagePrelude,
     NoInitialResponseError,
+    UnknownEventStreamEvent,
 )
 from botocore.exceptions import EventStreamError
-from botocore.parsers import EventStreamXMLParser
+from botocore.parsers import EventStreamXMLParser, ResponseParserError
 from tests import mock
 
 EMPTY_MESSAGE = (
@@ -492,6 +495,44 @@ def create_mock_raw_stream(*data):
     return raw_stream
 
 
+_PRELUDE_LENGTH = 12
+
+
+def encode_event_stream_message(headers, payload):
+    """Encodes headers and a payload into an event stream message.
+
+    Only string valued headers are supported as that is all that is
+    needed to exercise the event stream wrapper.
+    """
+    header_bytes = b''
+    for name, value in headers.items():
+        encoded_name = name.encode('utf-8')
+        encoded_value = value.encode('utf-8')
+        header_bytes += bytes([len(encoded_name)]) + encoded_name
+        # A type of 7 indicates a utf-8 string value
+        header_bytes += b'\x07' + len(encoded_value).to_bytes(2, 'big')
+        header_bytes += encoded_value
+    total_length = _PRELUDE_LENGTH + len(header_bytes) + len(payload) + 4
+    prelude = total_length.to_bytes(4, 'big') + len(header_bytes).to_bytes(
+        4, 'big'
+    )
+    message = prelude + (crc32(prelude) & 0xFFFFFFFF).to_bytes(4, 'big')
+    message += header_bytes + payload
+    message += (crc32(message) & 0xFFFFFFFF).to_bytes(4, 'big')
+    return message
+
+
+def create_event_message(event_type, payload=b''):
+    return encode_event_stream_message(
+        {
+            ':message-type': 'event',
+            ':event-type': event_type,
+            ':content-type': 'application/json',
+        },
+        payload,
+    )
+
+
 def test_event_stream_wrapper_iteration():
     raw_stream = create_mock_raw_stream(
         b"\x00\x00\x00+\x00\x00\x00\x0e4\x8b\xec{\x08event-id\x04\x00",
@@ -567,3 +608,151 @@ def test_event_stream_initial_response_no_event():
     event_stream = EventStream(raw_stream, output_shape, parser, '')
     with pytest.raises(NoInitialResponseError):
         event_stream.get_initial_response()
+
+
+def test_event_stream_unknown_event_skipped_by_default():
+    unknown_message = create_event_message('UnknownEvent', b'{"foo": "bar"}')
+    raw_stream = create_mock_raw_stream(unknown_message)
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    # A real parser produces an empty dict for unmodeled event types
+    parser.parse.return_value = {}
+    output_shape = mock.Mock()
+    output_shape.members = {}
+    event_stream = EventStream(raw_stream, output_shape, parser, '')
+    assert list(event_stream) == []
+
+
+def test_event_stream_unknown_event_passthrough():
+    unknown_message = create_event_message('UnknownEvent', b'{"foo": "bar"}')
+    # Feed the message to the stream one byte at a time to ensure
+    # chunking does not affect the passthrough behavior
+    raw_stream = create_mock_raw_stream(
+        *[unknown_message[i : i + 1] for i in range(len(unknown_message))]
+    )
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    output_shape = mock.Mock()
+    output_shape.members = {}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    events = list(event_stream)
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, UnknownEventStreamEvent)
+    assert event.event_type == 'UnknownEvent'
+    assert event.headers == {
+        ':message-type': 'event',
+        ':event-type': 'UnknownEvent',
+        ':content-type': 'application/json',
+    }
+    assert event.payload == b'{"foo": "bar"}'
+    parser.parse.assert_not_called()
+
+
+def test_event_stream_unknown_event_between_known_events():
+    known_message = create_event_message('KnownEvent', b'{"known": true}')
+    unknown_message = create_event_message('UnknownEvent', b'{"foo": "bar"}')
+    raw_stream = create_mock_raw_stream(
+        known_message, unknown_message, known_message
+    )
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parsed_known_event = {'KnownEvent': {'Payload': b'{"known": true}'}}
+    parser.parse.return_value = parsed_known_event
+    output_shape = mock.Mock()
+    output_shape.members = {'KnownEvent': mock.Mock()}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    events = list(event_stream)
+    assert len(events) == 3
+    assert events[0] == parsed_known_event
+    assert isinstance(events[1], UnknownEventStreamEvent)
+    assert events[1].event_type == 'UnknownEvent'
+    assert events[1].payload == b'{"foo": "bar"}'
+    assert events[2] == parsed_known_event
+    assert parser.parse.call_count == 2
+
+
+def test_event_stream_unknown_event_corrupted_frame_raises():
+    unknown_message = create_event_message('UnknownEvent', b'{"foo": "bar"}')
+    # Corrupt a byte in the middle of the payload so the message crc
+    # no longer matches
+    corrupt_index = len(unknown_message) - 6
+    corrupted = (
+        unknown_message[:corrupt_index]
+        + bytes([unknown_message[corrupt_index] ^ 0xFF])
+        + unknown_message[corrupt_index + 1 :]
+    )
+    raw_stream = create_mock_raw_stream(corrupted)
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    output_shape = mock.Mock()
+    output_shape.members = {}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    with pytest.raises(ChecksumMismatch):
+        list(event_stream)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {
+            ':message-type': 'error',
+            ':error-code': 'UnmodeledError',
+            ':error-message': 'some message',
+        },
+        {
+            ':message-type': 'exception',
+            ':exception-type': 'UnmodeledException',
+        },
+    ],
+    ids=['error', 'exception'],
+)
+def test_event_stream_error_messages_not_treated_as_unknown(headers):
+    error_message = encode_event_stream_message(headers, b'')
+    raw_stream = create_mock_raw_stream(error_message)
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parser.parse.return_value = {}
+    output_shape = mock.Mock()
+    output_shape.members = {}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    with pytest.raises(EventStreamError):
+        list(event_stream)
+
+
+def test_event_stream_known_event_parse_error_propagates():
+    known_message = create_event_message('KnownEvent', b'{"known": true}')
+    raw_stream = create_mock_raw_stream(known_message)
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parser.parse.side_effect = ResponseParserError(
+        'Unable to parse known event'
+    )
+    output_shape = mock.Mock()
+    output_shape.members = {'KnownEvent': mock.Mock()}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    with pytest.raises(ResponseParserError):
+        list(event_stream)
+
+
+def test_event_stream_unknown_event_underlying_body_closed_early():
+    known_message = create_event_message('KnownEvent', b'{"known": true}')
+    unknown_message = create_event_message('UnknownEvent', b'{"foo": "bar"}')
+    # The underlying body is closed before the unknown event is fully
+    # delivered, so only the complete known event is surfaced
+    raw_stream = create_mock_raw_stream(
+        known_message, unknown_message[: len(unknown_message) // 2]
+    )
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parsed_known_event = {'KnownEvent': {'Payload': b'{"known": true}'}}
+    parser.parse.return_value = parsed_known_event
+    output_shape = mock.Mock()
+    output_shape.members = {'KnownEvent': mock.Mock()}
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', include_unknown_events=True
+    )
+    assert list(event_stream) == [parsed_known_event]

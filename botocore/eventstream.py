@@ -351,6 +351,27 @@ class EventStreamMessage:
         }
 
 
+class UnknownEventStreamEvent:
+    """Represents an event stream event with an unmodeled event type.
+
+    This is only produced when an event stream is configured to pass
+    through unknown events. It is intentionally distinct from a parsed
+    event response dictionary so that unknown events cannot be mistaken
+    for modeled events.
+    """
+
+    def __init__(self, event_type, headers, payload):
+        self.event_type = event_type
+        self.headers = headers
+        self.payload = payload
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}(event_type={self.event_type!r}, '
+            f'headers={self.headers!r}, payload={self.payload!r})'
+        )
+
+
 class EventStreamHeaderParser:
     """Parses the event headers from an event stream message.
 
@@ -580,11 +601,19 @@ class EventStream:
             raise Exception("End event not received, request incomplete.")
     """
 
-    def __init__(self, raw_stream, output_shape, parser, operation_name):
+    def __init__(
+        self,
+        raw_stream,
+        output_shape,
+        parser,
+        operation_name,
+        include_unknown_events=False,
+    ):
         self._raw_stream = raw_stream
         self._output_shape = output_shape
         self._operation_name = operation_name
         self._parser = parser
+        self._include_unknown_events = include_unknown_events
         self._event_generator = self._create_raw_event_generator()
 
     def __iter__(self):
@@ -601,11 +630,27 @@ class EventStream:
 
     def _parse_event(self, event):
         response_dict = event.to_response_dict()
+        if response_dict['status_code'] == 200 and self._is_unknown_event(
+            event
+        ):
+            return UnknownEventStreamEvent(
+                event.headers.get(':event-type'),
+                event.headers,
+                event.payload,
+            )
         parsed_response = self._parser.parse(response_dict, self._output_shape)
         if response_dict['status_code'] == 200:
             return parsed_response
         else:
             raise EventStreamError(parsed_response, self._operation_name)
+
+    def _is_unknown_event(self, event):
+        if not self._include_unknown_events:
+            return False
+        if self._output_shape is None:
+            return True
+        event_type = event.headers.get(':event-type')
+        return event_type not in self._output_shape.members
 
     def get_initial_response(self):
         try:
