@@ -351,6 +351,25 @@ class EventStreamMessage:
         }
 
 
+class UnknownEvent:
+    """Represents an event with a type that is unknown to the client.
+
+    This is only produced when an ``EventStream`` is configured to pass
+    through unknown events. It is intentionally not a ``dict`` so that it
+    can be clearly distinguished from a normal modeled event, which is
+    always parsed into a ``dict``. It preserves the event type, the raw
+    headers, and the unparsed payload of the original event.
+    """
+
+    def __init__(self, event_type, headers, payload):
+        self.event_type = event_type
+        self.headers = headers
+        self.payload = payload
+
+    def __repr__(self):
+        return f'UnknownEvent(event_type={self.event_type!r})'
+
+
 class EventStreamHeaderParser:
     """Parses the event headers from an event stream message.
 
@@ -578,13 +597,27 @@ class EventStream:
                     end_event_received = True
         if not end_event_received:
             raise Exception("End event not received, request incomplete.")
+
+    By default, events whose type is not modeled by the client are
+    silently skipped. When ``allow_unknown_events`` is set to ``True``,
+    these events are instead surfaced as ``UnknownEvent`` instances so
+    that they can be inspected (e.g. logged) while known events continue
+    to be parsed as usual.
     """
 
-    def __init__(self, raw_stream, output_shape, parser, operation_name):
+    def __init__(
+        self,
+        raw_stream,
+        output_shape,
+        parser,
+        operation_name,
+        allow_unknown_events=False,
+    ):
         self._raw_stream = raw_stream
         self._output_shape = output_shape
         self._operation_name = operation_name
         self._parser = parser
+        self._allow_unknown_events = allow_unknown_events
         self._event_generator = self._create_raw_event_generator()
 
     def __iter__(self):
@@ -603,6 +636,18 @@ class EventStream:
         response_dict = event.to_response_dict()
         parsed_response = self._parser.parse(response_dict, self._output_shape)
         if response_dict['status_code'] == 200:
+            if not parsed_response and self._allow_unknown_events:
+                # The event type is not modeled by the client. Surface it as
+                # an UnknownEvent so it can be inspected (e.g. logged)
+                # without being confused for a normal modeled event. Note
+                # that the message has already passed all length and
+                # checksum validation in the EventStreamBuffer at this
+                # point, so only well-formed frames are ever passed through.
+                return UnknownEvent(
+                    event_type=event.headers.get(':event-type'),
+                    headers=event.headers,
+                    payload=event.payload,
+                )
             return parsed_response
         else:
             raise EventStreamError(parsed_response, self._operation_name)

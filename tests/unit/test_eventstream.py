@@ -12,6 +12,8 @@
 # language governing permissions and limitations under the License.
 """Unit tests for the binary event stream decoder."""
 
+from binascii import crc32
+
 import pytest
 
 from botocore.eventstream import (
@@ -26,6 +28,7 @@ from botocore.eventstream import (
     InvalidPayloadLength,
     MessagePrelude,
     NoInitialResponseError,
+    UnknownEvent,
 )
 from botocore.exceptions import EventStreamError
 from botocore.parsers import EventStreamXMLParser
@@ -492,6 +495,49 @@ def create_mock_raw_stream(*data):
     return raw_stream
 
 
+def encode_event_message(headers, payload):
+    """Encode an event stream message with string valued headers."""
+    header_bytes = b''
+    for name, value in headers:
+        encoded_name = name.encode('utf-8')
+        encoded_value = value.encode('utf-8')
+        header_bytes += bytes([len(encoded_name)]) + encoded_name
+        # A header type of 7 denotes a utf-8 string value
+        header_bytes += b'\x07' + len(encoded_value).to_bytes(2, 'big')
+        header_bytes += encoded_value
+    total_length = 12 + len(header_bytes) + len(payload) + 4
+    prelude = total_length.to_bytes(4, 'big')
+    prelude += len(header_bytes).to_bytes(4, 'big')
+    prelude += (crc32(prelude) & 0xFFFFFFFF).to_bytes(4, 'big')
+    message = prelude + header_bytes + payload
+    message += (crc32(message) & 0xFFFFFFFF).to_bytes(4, 'big')
+    return message
+
+
+def encode_event(event_type, payload=b''):
+    """Encode a normal event message with the given event type."""
+    headers = [
+        (':message-type', 'event'),
+        (':event-type', event_type),
+        (':content-type', 'application/json'),
+    ]
+    return encode_event_message(headers, payload)
+
+
+def create_parser_for_event_types(*event_types):
+    """Create a parser that only models the given event types."""
+    parser = mock.Mock(spec=EventStreamXMLParser)
+
+    def parse(response_dict, output_shape):
+        event_type = response_dict['headers'].get(':event-type')
+        if event_type in event_types:
+            return {event_type: {'Payload': response_dict['body']}}
+        return {}
+
+    parser.parse.side_effect = parse
+    return parser
+
+
 def test_event_stream_wrapper_iteration():
     raw_stream = create_mock_raw_stream(
         b"\x00\x00\x00+\x00\x00\x00\x0e4\x8b\xec{\x08event-id\x04\x00",
@@ -567,3 +613,167 @@ def test_event_stream_initial_response_no_event():
     event_stream = EventStream(raw_stream, output_shape, parser, '')
     with pytest.raises(NoInitialResponseError):
         event_stream.get_initial_response()
+
+
+def test_event_stream_unknown_event_skipped_by_default():
+    raw_stream = create_mock_raw_stream(
+        encode_event('KnownEvent', b'{"foo": "bar"}'),
+        encode_event('UnknownEvent', b'{"unknown": true}'),
+    )
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(raw_stream, output_shape, parser, '')
+    events = list(event_stream)
+    assert events == [{'KnownEvent': {'Payload': b'{"foo": "bar"}'}}]
+
+
+def test_event_stream_unknown_event_passthrough():
+    unknown_message = encode_event('UnknownEvent', b'{"unknown": true}')
+    raw_stream = create_mock_raw_stream(unknown_message)
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    events = list(event_stream)
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, UnknownEvent)
+    assert not isinstance(event, dict)
+    assert event.event_type == 'UnknownEvent'
+    assert event.headers == {
+        ':message-type': 'event',
+        ':event-type': 'UnknownEvent',
+        ':content-type': 'application/json',
+    }
+    assert event.payload == b'{"unknown": true}'
+
+
+def test_event_stream_unknown_event_between_known_events():
+    raw_stream = create_mock_raw_stream(
+        encode_event('KnownEvent', b'{"first": 1}'),
+        encode_event('UnknownEvent', b'{"unknown": true}'),
+        encode_event('OtherKnownEvent', b'{"last": 2}'),
+    )
+    parser = create_parser_for_event_types('KnownEvent', 'OtherKnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    events = list(event_stream)
+    assert len(events) == 3
+    assert events[0] == {'KnownEvent': {'Payload': b'{"first": 1}'}}
+    assert isinstance(events[1], UnknownEvent)
+    assert events[1].event_type == 'UnknownEvent'
+    assert events[1].payload == b'{"unknown": true}'
+    assert events[2] == {'OtherKnownEvent': {'Payload': b'{"last": 2}'}}
+
+
+def test_event_stream_unknown_event_passthrough_byte_by_byte():
+    unknown_message = encode_event('UnknownEvent', b'{"unknown": true}')
+    chunks = [unknown_message[i : i + 1] for i in range(len(unknown_message))]
+    raw_stream = create_mock_raw_stream(*chunks)
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    events = list(event_stream)
+    assert len(events) == 1
+    assert isinstance(events[0], UnknownEvent)
+    assert events[0].event_type == 'UnknownEvent'
+    assert events[0].payload == b'{"unknown": true}'
+
+
+def test_event_stream_unknown_event_with_corrupt_crc():
+    unknown_message = bytearray(encode_event('UnknownEvent', b'payload'))
+    # Corrupt a payload byte without fixing up the message crc
+    unknown_message[-6] ^= 0xFF
+    raw_stream = create_mock_raw_stream(bytes(unknown_message))
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    with pytest.raises(ChecksumMismatch):
+        list(event_stream)
+
+
+def test_event_stream_unknown_event_with_invalid_headers_length():
+    # A frame with a headers length beyond the maximum must be rejected
+    # before the unknown event type is ever considered.
+    prelude = (0x3D).to_bytes(4, 'big') + (0xFF000102).to_bytes(4, 'big')
+    prelude += (crc32(prelude) & 0xFFFFFFFF).to_bytes(4, 'big')
+    raw_stream = create_mock_raw_stream(prelude)
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    with pytest.raises(InvalidHeadersLength):
+        list(event_stream)
+
+
+def test_event_stream_known_event_parse_error_still_raised():
+    raw_stream = create_mock_raw_stream(
+        encode_event('KnownEvent', b'{"foo": "bar"}')
+    )
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parser.parse.side_effect = Exception('parse error')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    with pytest.raises(Exception, match='parse error'):
+        list(event_stream)
+
+
+def test_event_stream_error_message_not_passed_through():
+    raw_stream = create_mock_raw_stream(ERROR_EVENT_MESSAGE[0])
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parser.parse.return_value = {}
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    with pytest.raises(EventStreamError):
+        list(event_stream)
+
+
+def test_event_stream_exception_message_not_passed_through():
+    exception_message = encode_event_message(
+        [
+            (':message-type', 'exception'),
+            (':exception-type', 'UnknownException'),
+        ],
+        b'{"message": "oops"}',
+    )
+    raw_stream = create_mock_raw_stream(exception_message)
+    parser = mock.Mock(spec=EventStreamXMLParser)
+    parser.parse.return_value = {
+        'Error': {'Code': 'UnknownException', 'Message': 'oops'}
+    }
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    with pytest.raises(EventStreamError):
+        list(event_stream)
+
+
+def test_event_stream_unknown_event_body_closed_early():
+    known_message = encode_event('KnownEvent', b'{"foo": "bar"}')
+    unknown_message = encode_event('UnknownEvent', b'{"unknown": true}')
+    # The underlying body is closed early, mid-way through the unknown
+    # event. The complete known event is still yielded and the partial
+    # unknown event is silently discarded as the stream ends.
+    raw_stream = create_mock_raw_stream(
+        known_message + unknown_message[:15]
+    )
+    parser = create_parser_for_event_types('KnownEvent')
+    output_shape = mock.Mock()
+    event_stream = EventStream(
+        raw_stream, output_shape, parser, '', allow_unknown_events=True
+    )
+    events = list(event_stream)
+    assert events == [{'KnownEvent': {'Payload': b'{"foo": "bar"}'}}]
