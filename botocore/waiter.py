@@ -10,6 +10,8 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+import hashlib
+import json
 import logging
 import time
 from functools import partial
@@ -312,8 +314,115 @@ class AcceptorConfig:
         return acceptor_matches
 
 
+class _SystemClock:
+    """Default clock used by waiters, backed by the ``time`` module."""
+
+    def time(self):
+        return time.time()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
+class WaiterState:
+    """A serializable checkpoint of a waiter's progress.
+
+    The state can be serialized to a JSON token via ``to_json()`` and
+    later restored via ``from_json()``, allowing a wait to be resumed
+    by a new ``Waiter`` instance (potentially in a different process).
+
+    The token intentionally only contains bookkeeping information: the
+    number of attempts consumed so far, the next time a poll is allowed,
+    the total attempt limit, the current status, and a fingerprint of
+    the waiter model and request parameters.  It never contains
+    credentials, request parameters, or response payloads.
+    """
+
+    VERSION = 1
+    STATUS_WAITING = 'waiting'
+    STATUS_SUCCESS = 'success'
+    STATUS_FAILURE = 'failure'
+    _ALL_STATUSES = (STATUS_WAITING, STATUS_SUCCESS, STATUS_FAILURE)
+    _TERMINAL_STATUSES = (STATUS_SUCCESS, STATUS_FAILURE)
+
+    def __init__(
+        self,
+        fingerprint,
+        max_attempts,
+        attempts=0,
+        next_poll_at=None,
+        status=STATUS_WAITING,
+        reason=None,
+    ):
+        self.fingerprint = fingerprint
+        self.max_attempts = max_attempts
+        self.attempts = attempts
+        self.next_poll_at = next_poll_at
+        self.status = status
+        self.reason = reason
+        # The last response is only kept for the lifetime of this object
+        # so it can be attached to raised WaiterErrors.  It is never
+        # serialized into the JSON token.
+        self.last_response = None
+
+    @property
+    def is_terminal(self):
+        return self.status in self._TERMINAL_STATUSES
+
+    def to_json(self):
+        """Serialize the state to a JSON token."""
+        return json.dumps(
+            {
+                'version': self.VERSION,
+                'fingerprint': self.fingerprint,
+                'attempts': self.attempts,
+                'max_attempts': self.max_attempts,
+                'next_poll_at': self.next_poll_at,
+                'status': self.status,
+                'reason': self.reason,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, payload):
+        """Restore a state from a JSON token.
+
+        :raises ValueError: If the token is malformed or uses an
+            unsupported version.
+        """
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f'Invalid waiter state token: {e}')
+        if not isinstance(data, dict):
+            raise ValueError(
+                'Invalid waiter state token: expected a JSON object'
+            )
+        if data.get('version') != cls.VERSION:
+            raise ValueError(
+                f'Unsupported waiter state version: {data.get("version")}'
+            )
+        try:
+            state = cls(
+                fingerprint=data['fingerprint'],
+                max_attempts=data['max_attempts'],
+                attempts=data['attempts'],
+                next_poll_at=data['next_poll_at'],
+                status=data['status'],
+                reason=data['reason'],
+            )
+        except KeyError as e:
+            raise ValueError(
+                f'Invalid waiter state token, missing field: {e}'
+            )
+        if state.status not in cls._ALL_STATUSES:
+            raise ValueError(f'Invalid waiter status: {state.status}')
+        return state
+
+
 class Waiter:
-    def __init__(self, name, config, operation_method):
+    def __init__(self, name, config, operation_method, clock=None):
         """
 
         :type name: string
@@ -327,8 +436,15 @@ class Waiter:
             and returns a response.  For example, this can be
             a method from a botocore client.
 
+        :type clock: object
+        :param clock: An optional clock object providing ``time()`` and
+            ``sleep(seconds)`` methods.  This is primarily useful for
+            testing and for resumable waits that need to reason about
+            time.  Defaults to a clock backed by the ``time`` module.
+
         """
         self._operation_method = operation_method
+        self._clock = clock if clock is not None else _SystemClock()
         # The two attributes are exposed to allow for introspection
         # and documentation.
         self.name = name
@@ -336,61 +452,201 @@ class Waiter:
 
     @with_current_context(partial(register_feature_id, 'WAITER'))
     def wait(self, **kwargs):
-        acceptors = list(self.config.acceptors)
-        current_state = 'waiting'
         # pop the invocation specific config
         config = kwargs.pop('WaiterConfig', {})
         sleep_amount = config.get('Delay', self.config.delay)
         max_attempts = config.get('MaxAttempts', self.config.max_attempts)
-        last_matched_acceptor = None
-        num_attempts = 0
+        state = WaiterState(fingerprint=None, max_attempts=max_attempts)
+        self._run_wait_loop(state, kwargs, sleep_amount)
+        if state.status == WaiterState.STATUS_SUCCESS:
+            return
+        raise WaiterError(
+            name=self.name,
+            reason=state.reason,
+            last_response=state.last_response,
+        )
 
+    @with_current_context(partial(register_feature_id, 'WAITER'))
+    def wait_resumable(self, **kwargs):
+        """Poll the waiter, returning a JSON state token when not done.
+
+        This behaves like ``wait()`` except that the wait can be split
+        across multiple invocations (and processes).  Each call returns
+        a JSON state token (see :class:`WaiterState`) unless the wait
+        reaches a terminal failure state, in which case a
+        :class:`botocore.exceptions.WaiterError` is raised with the
+        state token attached as its ``state`` attribute.
+
+        In addition to the ``Delay`` and ``MaxAttempts`` keys supported
+        by ``wait()``, the ``WaiterConfig`` argument supports:
+
+        * ``RunAttempts`` - The maximum number of polls to perform in
+          this call before returning a ``waiting`` state token.  If not
+          provided, the call polls until a terminal state is reached.
+        * ``ResumeState`` - A JSON state token returned by a previous
+          ``wait_resumable()`` call.  The wait then continues where the
+          previous call left off, honoring the original ``MaxAttempts``
+          limit and the earliest allowed time of the next poll.
+
+        Resuming is refused with a ``WaiterError`` if the waiter model
+        or request parameters no longer match the state token, or if
+        the token already reached a terminal state.
+
+        :rtype: str
+        :return: A JSON state token.  Its ``status`` field is one of
+            ``waiting`` or ``success`` (failures are raised as
+            ``WaiterError``).
+        """
+        # pop the invocation specific config
+        config = dict(kwargs.pop('WaiterConfig', {}))
+        resume_token = config.pop('ResumeState', None)
+        max_run_attempts = config.pop('RunAttempts', None)
+        sleep_amount = config.get('Delay', self.config.delay)
+        fingerprint = self._fingerprint(kwargs, config)
+        if resume_token is None:
+            state = WaiterState(
+                fingerprint=fingerprint,
+                max_attempts=config.get(
+                    'MaxAttempts', self.config.max_attempts
+                ),
+            )
+        else:
+            state = self._load_resume_state(resume_token, fingerprint)
+            if state.status == WaiterState.STATUS_SUCCESS:
+                # A completed wait never issues further requests.
+                return state.to_json()
+            if state.status == WaiterState.STATUS_FAILURE:
+                self._raise_failure(state)
+        self._run_wait_loop(state, kwargs, sleep_amount, max_run_attempts)
+        if state.status == WaiterState.STATUS_FAILURE:
+            self._raise_failure(state)
+        return state.to_json()
+
+    def _fingerprint(self, kwargs, invocation_config):
+        acceptors = [
+            {
+                'state': acceptor.state,
+                'matcher': acceptor.matcher,
+                'expected': acceptor.expected,
+                'argument': acceptor.argument,
+            }
+            for acceptor in self.config.acceptors
+        ]
+        payload = {
+            'name': self.name,
+            'operation': self.config.operation,
+            'delay': self.config.delay,
+            'max_attempts': self.config.max_attempts,
+            'acceptors': acceptors,
+            'invocation_config': invocation_config,
+            'request': kwargs,
+        }
+        # Only a hash of the model and request parameters is stored in
+        # the state token, never the values themselves, so credentials
+        # or other sensitive parameter values are never persisted.
+        serialized = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+    def _load_resume_state(self, token, fingerprint):
+        try:
+            state = WaiterState.from_json(token)
+        except ValueError as e:
+            raise WaiterError(
+                name=self.name,
+                reason=f'Cannot resume waiter: {e}',
+                last_response=None,
+            )
+        if state.fingerprint != fingerprint:
+            raise WaiterError(
+                name=self.name,
+                reason=(
+                    'Cannot resume waiter: the waiter model or request '
+                    'parameters do not match the provided state token.'
+                ),
+                last_response=None,
+            )
+        return state
+
+    def _raise_failure(self, state):
+        error = WaiterError(
+            name=self.name,
+            reason=state.reason,
+            last_response=state.last_response,
+        )
+        error.state = state.to_json()
+        raise error
+
+    def _run_wait_loop(self, state, kwargs, sleep_amount,
+                       max_run_attempts=None):
+        acceptors = list(self.config.acceptors)
+        last_matched_acceptor = None
+        run_attempts = 0
+        if state.attempts >= state.max_attempts:
+            state.status = WaiterState.STATUS_FAILURE
+            state.reason = 'Max attempts exceeded'
+            return
+        if max_run_attempts is not None and max_run_attempts <= 0:
+            return
+        if state.next_poll_at is not None:
+            # A resumed wait first has to wait until the next poll
+            # is allowed before making another request.
+            remaining = state.next_poll_at - self._clock.time()
+            if remaining > 0:
+                self._clock.sleep(remaining)
         while True:
+            if run_attempts > 0:
+                self._clock.sleep(sleep_amount)
             response = self._operation_method(**kwargs)
-            num_attempts += 1
+            state.attempts += 1
+            run_attempts += 1
+            state.last_response = response
+            state.next_poll_at = self._clock.time() + sleep_amount
+            matched_acceptor = None
             for acceptor in acceptors:
                 if acceptor.matcher_func(response):
+                    matched_acceptor = acceptor
                     last_matched_acceptor = acceptor
-                    current_state = acceptor.state
                     break
-            else:
+            if matched_acceptor is None and is_valid_waiter_error(response):
                 # If none of the acceptors matched, we should
                 # transition to the failure state if an error
                 # response was received.
-                if is_valid_waiter_error(response):
-                    # Transition to a failure state, which we
-                    # can just handle here by raising an exception.
-                    raise WaiterError(
-                        name=self.name,
-                        reason='An error occurred ({}): {}'.format(
-                            response['Error'].get('Code', 'Unknown'),
-                            response['Error'].get('Message', 'Unknown'),
-                        ),
-                        last_response=response,
-                    )
-            if current_state == 'success':
-                logger.debug(
-                    "Waiting complete, waiter matched the success state."
+                state.status = WaiterState.STATUS_FAILURE
+                state.reason = 'An error occurred ({}): {}'.format(
+                    response['Error'].get('Code', 'Unknown'),
+                    response['Error'].get('Message', 'Unknown'),
                 )
                 return
-            if current_state == 'failure':
-                reason = f'Waiter encountered a terminal failure state: {acceptor.explanation}'
-                raise WaiterError(
-                    name=self.name,
-                    reason=reason,
-                    last_response=response,
-                )
-            if num_attempts >= max_attempts:
+            if matched_acceptor is not None:
+                if matched_acceptor.state == 'success':
+                    logger.debug(
+                        "Waiting complete, waiter matched the "
+                        "success state."
+                    )
+                    state.status = WaiterState.STATUS_SUCCESS
+                    return
+                if matched_acceptor.state == 'failure':
+                    state.status = WaiterState.STATUS_FAILURE
+                    state.reason = (
+                        'Waiter encountered a terminal failure state: '
+                        f'{matched_acceptor.explanation}'
+                    )
+                    return
+            if state.attempts >= state.max_attempts:
+                state.status = WaiterState.STATUS_FAILURE
                 if last_matched_acceptor is None:
-                    reason = 'Max attempts exceeded'
+                    state.reason = 'Max attempts exceeded'
                 else:
-                    reason = (
+                    state.reason = (
                         f'Max attempts exceeded. Previously accepted state: '
                         f'{acceptor.explanation}'
                     )
-                raise WaiterError(
-                    name=self.name,
-                    reason=reason,
-                    last_response=response,
-                )
-            time.sleep(sleep_amount)
+                return
+            if (
+                max_run_attempts is not None
+                and run_attempts >= max_run_attempts
+            ):
+                # The budget for this run is exhausted, but the wait
+                # itself is not done yet.  The caller can persist the
+                # state token and resume later.
+                return

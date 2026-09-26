@@ -11,20 +11,23 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import io
+import json
 import os
 
 import botocore
 from botocore.exceptions import ClientError, WaiterConfigError, WaiterError
 from botocore.loaders import Loader
 from botocore.model import ServiceModel
+from botocore.stub import Stubber
 from botocore.waiter import (
     NormalizedOperationMethod,
     SingleWaiterConfig,
     Waiter,
     WaiterModel,
+    WaiterState,
     create_waiter_with_client,
 )
-from tests import BaseEnvVar, mock, unittest
+from tests import BaseEnvVar, BaseSessionTest, mock, unittest
 
 
 class TestWaiterModel(unittest.TestCase):
@@ -834,6 +837,357 @@ class TestOperationMethods(unittest.TestCase):
         client_method.side_effect = exception
         actual_response = op(Foo='a', Bar='b')
         self.assertEqual(actual_response, parsed_response)
+
+
+class FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+        self.sleeps = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class TestWaiterState(unittest.TestCase):
+    def test_roundtrip(self):
+        state = WaiterState(
+            fingerprint='abc123',
+            max_attempts=10,
+            attempts=3,
+            next_poll_at=1234.5,
+            status=WaiterState.STATUS_WAITING,
+        )
+        restored = WaiterState.from_json(state.to_json())
+        self.assertEqual(restored.fingerprint, 'abc123')
+        self.assertEqual(restored.max_attempts, 10)
+        self.assertEqual(restored.attempts, 3)
+        self.assertEqual(restored.next_poll_at, 1234.5)
+        self.assertEqual(restored.status, WaiterState.STATUS_WAITING)
+        self.assertFalse(restored.is_terminal)
+
+    def test_terminal_statuses(self):
+        for status in (
+            WaiterState.STATUS_SUCCESS,
+            WaiterState.STATUS_FAILURE,
+        ):
+            state = WaiterState(
+                fingerprint='abc', max_attempts=1, status=status
+            )
+            self.assertTrue(state.is_terminal)
+
+    def test_from_json_rejects_malformed_token(self):
+        with self.assertRaises(ValueError):
+            WaiterState.from_json('not json')
+
+    def test_from_json_rejects_non_object_token(self):
+        with self.assertRaises(ValueError):
+            WaiterState.from_json('[1, 2, 3]')
+
+    def test_from_json_rejects_unknown_version(self):
+        token = json.dumps({'version': 999})
+        with self.assertRaises(ValueError):
+            WaiterState.from_json(token)
+
+    def test_from_json_rejects_missing_fields(self):
+        token = json.dumps({'version': WaiterState.VERSION})
+        with self.assertRaises(ValueError):
+            WaiterState.from_json(token)
+
+    def test_from_json_rejects_unknown_status(self):
+        state = WaiterState(fingerprint='abc', max_attempts=1)
+        token = json.loads(state.to_json())
+        token['status'] = 'bogus'
+        with self.assertRaises(ValueError):
+            WaiterState.from_json(json.dumps(token))
+
+
+class TestResumableWaiter(BaseSessionTest):
+    def setUp(self):
+        super().setUp()
+        self.client = self.session.create_client('dynamodb', 'us-east-1')
+        waiter_model = self.session.get_waiter_model('dynamodb')
+        self.config = waiter_model.get_waiter('TableExists')
+        self.clock = FakeClock()
+        self.stubber = Stubber(self.client)
+        self.stubber.activate()
+        self.waiter_config = {'Delay': 5, 'MaxAttempts': 5}
+
+    def tearDown(self):
+        self.stubber.deactivate()
+        super().tearDown()
+
+    def create_waiter(self, config=None):
+        operation = NormalizedOperationMethod(self.client.describe_table)
+        return Waiter(
+            'TableExists', config or self.config, operation, clock=self.clock
+        )
+
+    def add_table_responses(self, *statuses):
+        for status in statuses:
+            self.stubber.add_response(
+                'describe_table',
+                {'Table': {'TableName': 'my-table', 'TableStatus': status}},
+                expected_params={'TableName': 'my-table'},
+            )
+
+    def test_state_token_contains_no_params_or_responses(self):
+        self.add_table_responses('CREATING')
+        waiter = self.create_waiter()
+        token = waiter.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=1),
+        )
+        state = json.loads(token)
+        self.assertEqual(
+            set(state),
+            {
+                'version',
+                'fingerprint',
+                'attempts',
+                'max_attempts',
+                'next_poll_at',
+                'status',
+                'reason',
+            },
+        )
+        # The token must not leak request parameters, credentials, or
+        # response payloads.
+        self.assertNotIn('my-table', token)
+        self.assertNotIn('secret_key', token)
+        self.assertNotIn('CREATING', token)
+        self.assertEqual(state['attempts'], 1)
+        self.assertEqual(state['max_attempts'], 5)
+        self.assertEqual(state['status'], 'waiting')
+        self.assertEqual(state['next_poll_at'], 1005.0)
+
+    def test_two_segments_match_continuous_run(self):
+        # A single continuous run: two retries then success.
+        self.add_table_responses('CREATING', 'CREATING', 'ACTIVE')
+        waiter = self.create_waiter()
+        waiter.wait(TableName='my-table', WaiterConfig=self.waiter_config)
+        self.stubber.assert_no_pending_responses()
+        continuous_sleeps = list(self.clock.sleeps)
+        continuous_now = self.clock.now
+
+        # The same wait split across two waiter instances.
+        self.clock = FakeClock()
+        self.add_table_responses('CREATING', 'CREATING', 'ACTIVE')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=2),
+        )
+        state = WaiterState.from_json(token)
+        self.assertEqual(state.status, WaiterState.STATUS_WAITING)
+        self.assertEqual(state.attempts, 2)
+
+        second_leg = self.create_waiter()
+        token = second_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, ResumeState=token),
+        )
+        state = WaiterState.from_json(token)
+        self.assertEqual(state.status, WaiterState.STATUS_SUCCESS)
+        self.assertEqual(state.attempts, 3)
+        self.stubber.assert_no_pending_responses()
+
+        # Both runs made the same decisions: same number of requests,
+        # same sleeps, and the same final point in time.
+        self.assertEqual(self.clock.sleeps, continuous_sleeps)
+        self.assertEqual(self.clock.now, continuous_now)
+
+    def test_two_segments_match_continuous_failure(self):
+        # A continuous run that exhausts MaxAttempts.
+        self.add_table_responses('CREATING', 'CREATING', 'CREATING')
+        waiter = self.create_waiter()
+        with self.assertRaises(WaiterError) as cm:
+            waiter.wait(
+                TableName='my-table',
+                WaiterConfig=dict(self.waiter_config, MaxAttempts=3),
+            )
+        continuous_reason = str(cm.exception)
+        self.stubber.assert_no_pending_responses()
+
+        # The same wait split across two waiter instances is still
+        # bound by the original MaxAttempts limit.
+        self.add_table_responses('CREATING', 'CREATING', 'CREATING')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(
+                self.waiter_config, MaxAttempts=3, RunAttempts=2
+            ),
+        )
+        self.assertEqual(
+            WaiterState.from_json(token).status, WaiterState.STATUS_WAITING
+        )
+        second_leg = self.create_waiter()
+        with self.assertRaises(WaiterError) as cm:
+            second_leg.wait_resumable(
+                TableName='my-table',
+                WaiterConfig=dict(
+                    self.waiter_config, MaxAttempts=3, ResumeState=token
+                ),
+            )
+        self.assertEqual(str(cm.exception), continuous_reason)
+        # The terminal failure state is attached to the exception and
+        # records all attempts made across both segments.
+        state = WaiterState.from_json(cm.exception.state)
+        self.assertEqual(state.status, WaiterState.STATUS_FAILURE)
+        self.assertEqual(state.attempts, 3)
+        self.stubber.assert_no_pending_responses()
+
+    def test_resume_waits_until_next_allowed_poll_time(self):
+        self.add_table_responses('CREATING', 'ACTIVE')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=1),
+        )
+        self.assertEqual(self.clock.sleeps, [])
+        # Simulate time passing between the two jobs, but not enough
+        # for the next poll to be allowed yet.
+        self.clock.now = 1002.0
+        second_leg = self.create_waiter()
+        second_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, ResumeState=token),
+        )
+        # The resumed waiter slept for the remaining delay before
+        # making its first request.
+        self.assertEqual(self.clock.sleeps, [3.0])
+        self.stubber.assert_no_pending_responses()
+
+    def test_resume_rejects_changed_request_params(self):
+        self.add_table_responses('CREATING', 'ACTIVE')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=1),
+        )
+        second_leg = self.create_waiter()
+        with self.assertRaises(WaiterError):
+            second_leg.wait_resumable(
+                TableName='other-table',
+                WaiterConfig=dict(self.waiter_config, ResumeState=token),
+            )
+        # The refused resume did not consume the queued response, so a
+        # resume with the original parameters still succeeds.
+        token = second_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, ResumeState=token),
+        )
+        self.assertEqual(
+            WaiterState.from_json(token).status, WaiterState.STATUS_SUCCESS
+        )
+        self.stubber.assert_no_pending_responses()
+
+    def test_resume_rejects_changed_acceptor_definition(self):
+        self.add_table_responses('CREATING')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=1),
+        )
+        changed_config = SingleWaiterConfig(
+            {
+                'operation': 'DescribeTable',
+                'delay': 20,
+                'maxAttempts': 25,
+                'acceptors': [
+                    {
+                        'state': 'success',
+                        'matcher': 'path',
+                        'argument': 'Table.TableStatus',
+                        'expected': 'DELETED',
+                    }
+                ],
+            }
+        )
+        second_leg = self.create_waiter(config=changed_config)
+        with self.assertRaises(WaiterError):
+            second_leg.wait_resumable(
+                TableName='my-table',
+                WaiterConfig=dict(self.waiter_config, ResumeState=token),
+            )
+
+    def test_resume_rejects_changed_invocation_config(self):
+        self.add_table_responses('CREATING')
+        first_leg = self.create_waiter()
+        token = first_leg.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, RunAttempts=1),
+        )
+        second_leg = self.create_waiter()
+        with self.assertRaises(WaiterError):
+            second_leg.wait_resumable(
+                TableName='my-table',
+                WaiterConfig=dict(
+                    self.waiter_config, Delay=30, ResumeState=token
+                ),
+            )
+
+    def test_resume_rejects_malformed_token(self):
+        waiter = self.create_waiter()
+        with self.assertRaises(WaiterError):
+            waiter.wait_resumable(
+                TableName='my-table',
+                WaiterConfig=dict(
+                    self.waiter_config, ResumeState='not json'
+                ),
+            )
+
+    def test_successful_terminal_state_makes_no_more_requests(self):
+        self.add_table_responses('ACTIVE')
+        waiter = self.create_waiter()
+        token = waiter.wait_resumable(
+            TableName='my-table', WaiterConfig=self.waiter_config
+        )
+        self.assertEqual(
+            WaiterState.from_json(token).status, WaiterState.STATUS_SUCCESS
+        )
+        # Resuming a completed wait returns the terminal state without
+        # making any further requests (the stubber queue is empty, so
+        # any request would raise).
+        resumed = self.create_waiter()
+        resumed_token = resumed.wait_resumable(
+            TableName='my-table',
+            WaiterConfig=dict(self.waiter_config, ResumeState=token),
+        )
+        self.assertEqual(
+            WaiterState.from_json(resumed_token).status,
+            WaiterState.STATUS_SUCCESS,
+        )
+
+    def test_failed_terminal_state_makes_no_more_requests(self):
+        self.stubber.add_client_error(
+            'describe_table',
+            service_error_code='AccessDeniedException',
+            service_message='denied',
+            expected_params={'TableName': 'my-table'},
+        )
+        waiter = self.create_waiter()
+        with self.assertRaises(WaiterError) as cm:
+            waiter.wait_resumable(
+                TableName='my-table', WaiterConfig=self.waiter_config
+            )
+        token = cm.exception.state
+        self.assertEqual(
+            WaiterState.from_json(token).status, WaiterState.STATUS_FAILURE
+        )
+        # Resuming a failed wait raises immediately without making any
+        # further requests (the stubber queue is empty, so any request
+        # would raise).
+        resumed = self.create_waiter()
+        with self.assertRaises(WaiterError):
+            resumed.wait_resumable(
+                TableName='my-table',
+                WaiterConfig=dict(self.waiter_config, ResumeState=token),
+            )
 
 
 class ServiceWaiterFunctionalTest(BaseEnvVar):
