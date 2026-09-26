@@ -14,6 +14,8 @@
 import base64
 import json
 import logging
+import re
+from collections import OrderedDict
 from functools import partial
 from itertools import tee
 
@@ -25,6 +27,21 @@ from botocore.useragent import register_feature_id
 from botocore.utils import merge_dicts, set_value_from_jmespath
 
 log = logging.getLogger(__name__)
+
+# Default number of most recent service-provided pagination tokens that
+# are remembered to detect token cycles (e.g. A -> B -> A).  A value of
+# 0 disables cycle detection entirely.
+DEFAULT_CYCLE_DETECTION_WINDOW = 10
+
+# Sentinel used to distinguish a token field that is absent from the
+# response from one that is present with a value of None.
+_MISSING = object()
+
+# Matches simple dotted jmespath paths (e.g. "NextToken" or "foo.bar")
+# that can be resolved by walking dictionaries directly.
+_SIMPLE_TOKEN_PATH_RE = re.compile(
+    r'[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z'
+)
 
 
 class TokenEncoder:
@@ -206,6 +223,7 @@ class PageIterator:
         starting_token,
         page_size,
         op_kwargs,
+        cycle_detection_window=None,
     ):
         self._method = method
         self._input_token = input_token
@@ -222,6 +240,14 @@ class PageIterator:
         self._non_aggregate_part = {}
         self._token_encoder = TokenEncoder()
         self._token_decoder = TokenDecoder()
+        if cycle_detection_window is None:
+            cycle_detection_window = DEFAULT_CYCLE_DETECTION_WINDOW
+        self._cycle_detection_window = cycle_detection_window
+        # Maps a fingerprint of each service-provided token to the number
+        # of the request that produced it.  Bounded by
+        # ``cycle_detection_window`` so memory usage stays constant.
+        self._seen_token_fingerprints = OrderedDict()
+        self._request_count = 0
 
     @property
     def result_keys(self):
@@ -254,7 +280,6 @@ class PageIterator:
 
     def __iter__(self):
         current_kwargs = self._op_kwargs
-        previous_next_token = None
         next_token = {key: None for key in self._input_token}
         if self._starting_token is not None:
             # If the starting token exists, populate the next_token with the
@@ -262,6 +287,8 @@ class PageIterator:
             # pagination token on hand if we need to truncate after the
             # first response.
             next_token = self._parse_starting_token()[0]
+        self._seen_token_fingerprints = OrderedDict()
+        self._request_count = 0
         # The number of items from result_key we've seen so far.
         total_items = 0
         first_request = True
@@ -270,6 +297,7 @@ class PageIterator:
         self._inject_starting_params(current_kwargs)
         while True:
             response = self._make_request(current_kwargs)
+            self._request_count += 1
             parsed = self._extract_parsed_response(response)
             if first_request:
                 # The first request is handled differently.  We could
@@ -319,16 +347,72 @@ class PageIterator:
                     # next token to be the resume token.
                     self.resume_token = next_token
                     break
-                if (
-                    previous_next_token is not None
-                    and previous_next_token == next_token
-                ):
-                    message = (
-                        f"The same next token was received twice: {next_token}"
-                    )
-                    raise PaginationError(message=message)
+                self._check_for_token_cycle(parsed)
                 self._inject_token_into_kwargs(current_kwargs, next_token)
-                previous_next_token = next_token
+
+    def _check_for_token_cycle(self, parsed):
+        window = self._cycle_detection_window
+        if not window:
+            # Cycle detection is disabled.
+            return
+        fingerprint = self._get_token_fingerprint(parsed)
+        seen = self._seen_token_fingerprints
+        previous_request = seen.get(fingerprint)
+        if previous_request is not None:
+            span = self._request_count - previous_request
+            message = (
+                "The service returned a pagination token identical to one "
+                "from an earlier response, indicating a pagination cycle "
+                f"(first returned by request {previous_request}, returned "
+                f"again by request {self._request_count}, a cycle span of "
+                f"{span} request(s)). Token contents are omitted to avoid "
+                "exposing potentially sensitive data."
+            )
+            raise PaginationError(message=message)
+        seen[fingerprint] = self._request_count
+        while len(seen) > window:
+            seen.popitem(last=False)
+
+    def _get_token_fingerprint(self, parsed):
+        # Build a hashable fingerprint of the full, multi-field token as
+        # returned by the service.  Unlike _get_next_token, the raw values
+        # are inspected so that a missing field, an empty string, and None
+        # are treated as distinct, and no client-side state (such as
+        # boto_truncate_amount resume markers) is included.
+        fingerprint = []
+        for output_token, input_key in zip(
+            self._output_token, self._input_token
+        ):
+            value = self._extract_raw_token_value(parsed, output_token)
+            fingerprint.append((input_key, self._fingerprint_value(value)))
+        return tuple(fingerprint)
+
+    def _extract_raw_token_value(self, parsed, output_token):
+        path = _SIMPLE_TOKEN_PATH_RE.match(output_token.expression)
+        if path is None:
+            # Complex expressions cannot be walked key by key, so missing
+            # and None cannot be distinguished for them.
+            return output_token.search(parsed)
+        current = parsed
+        for key in output_token.expression.split('.'):
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return _MISSING
+        return current
+
+    def _fingerprint_value(self, value):
+        if value is _MISSING:
+            return ('missing',)
+        if value is None:
+            return ('null',)
+        if value == '':
+            return ('empty',)
+        try:
+            hash(value)
+        except TypeError:
+            value = json.dumps(value, sort_keys=True, default=repr)
+        return ('value', value)
 
     def search(self, expression):
         """Applies a JMESPath expression to a paginator
@@ -674,6 +758,7 @@ class Paginator:
             page_params['StartingToken'],
             page_params['PageSize'],
             kwargs,
+            cycle_detection_window=page_params['CycleDetectionWindow'],
         )
 
     def _extract_paging_params(self, kwargs):
@@ -695,10 +780,21 @@ class Paginator:
                     page_size = str(page_size)
             else:
                 page_size = int(page_size)
+        cycle_detection_window = pagination_config.get(
+            'CycleDetectionWindow', None
+        )
+        if cycle_detection_window is not None:
+            cycle_detection_window = int(cycle_detection_window)
+            if cycle_detection_window < 0:
+                raise PaginationError(
+                    message="CycleDetectionWindow must be a non-negative "
+                    "integer. Use 0 to disable pagination cycle detection."
+                )
         return {
             'MaxItems': max_items,
             'StartingToken': pagination_config.get('StartingToken', None),
             'PageSize': page_size,
+            'CycleDetectionWindow': cycle_detection_window,
         }
 
 
