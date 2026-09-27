@@ -670,6 +670,7 @@ class S3PostPresigner:
         conditions=None,
         expires_in=3600,
         region_name=None,
+        validate_policy=False,
     ):
         """Generates the url and the form fields used for a presigned s3 post
 
@@ -699,6 +700,13 @@ class S3PostPresigner:
 
         :type region_name: string
         :param region_name: The region name to sign the presigned post to.
+
+        :type validate_policy: bool
+        :param validate_policy: Whether to locally validate that the
+            fields and conditions are consistent with each other before
+            signing. Raises an error if a field is not covered by any
+            condition, if a condition uses an unknown operator, or if
+            conditions contradict each other.
 
         :rtype: dict
         :returns: A dictionary with two elements: ``url`` and ``fields``.
@@ -741,6 +749,8 @@ class S3PostPresigner:
         request = create_request_object(request_dict)
         request.context['s3-presign-post-fields'] = fields
         request.context['s3-presign-post-policy'] = policy
+        if validate_policy:
+            request.context['s3-presign-post-validate-policy'] = True
 
         self._request_signer.sign(
             'PutObject', request, region_name, 'presign-post'
@@ -848,7 +858,13 @@ def add_generate_presigned_post(class_attributes, **kwargs):
 
 
 def generate_presigned_post(
-    self, Bucket, Key, Fields=None, Conditions=None, ExpiresIn=3600
+    self,
+    Bucket,
+    Key,
+    Fields=None,
+    Conditions=None,
+    ExpiresIn=3600,
+    ValidatePolicy=False,
 ):
     """Builds the url and the form fields used for a presigned s3 post
 
@@ -900,6 +916,16 @@ def generate_presigned_post(
     :type ExpiresIn: int
     :param ExpiresIn: The number of seconds the presigned post
         is valid for.
+
+    :type ValidatePolicy: bool
+    :param ValidatePolicy: Whether to locally validate the fields and
+        conditions before signing. When enabled, the conditions are
+        checked for unknown condition types, fields that are not covered
+        by any condition, and contradictions between conditions
+        (including the automatically added bucket, key, and signing
+        fields). A ``${filename}`` suffix in the key is treated as a
+        placeholder and only constrains the key prefix. An error is
+        raised before anything is signed if the policy is invalid.
 
     :rtype: dict
     :returns: A dictionary with two elements: ``url`` and ``fields``.
@@ -987,6 +1013,7 @@ def generate_presigned_post(
         fields=fields,
         conditions=conditions,
         expires_in=expires_in,
+        validate_policy=ValidatePolicy,
     )
 
 

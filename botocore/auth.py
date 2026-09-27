@@ -43,6 +43,7 @@ from botocore.exceptions import (
     UnknownSignatureVersionError,
     UnsupportedSignatureVersionError,
 )
+from botocore.postpolicy import validate_post_policy
 from botocore.utils import (
     is_valid_ipv6_endpoint_url,
     normalize_url_path,
@@ -851,6 +852,9 @@ class S3SigV4PostAuth(SigV4Auth):
         if self.credentials.token is not None:
             fields['x-amz-security-token'] = self.credentials.token
             conditions.append({'x-amz-security-token': self.credentials.token})
+
+        if request.context.get('s3-presign-post-validate-policy'):
+            validate_post_policy(fields, conditions)
 
         # Dump the base64 encoded policy into the fields dictionary.
         fields['policy'] = base64.b64encode(

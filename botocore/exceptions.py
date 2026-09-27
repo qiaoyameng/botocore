@@ -861,3 +861,35 @@ class UnsupportedServiceProtocolsError(BotoCoreError):
         'Botocore supports {botocore_supported_protocols}, but service {service} only '
         'supports {service_supported_protocols}.'
     )
+
+
+class PresignedPostPolicyError(BotoCoreError):
+    """Base error for presigned POST policy validation failures."""
+
+    fmt = 'Invalid presigned POST policy: {detail}'
+
+
+class MissingFieldConditionError(PresignedPostPolicyError):
+    """A form field has no matching condition in the POST policy."""
+
+    fmt = (
+        "The field '{field}' is included in the presigned POST fields but "
+        'has no matching condition in the policy. Every field in a '
+        'presigned POST must be covered by a condition.'
+    )
+
+
+class UnknownConditionTypeError(PresignedPostPolicyError):
+    """A policy condition uses an unknown operator or is malformed."""
+
+    fmt = (
+        'Unsupported condition in presigned POST policy: {detail}. '
+        'Conditions must be exact-match dictionaries or lists using one '
+        "of the 'eq', 'starts-with', or 'content-length-range' operators."
+    )
+
+
+class ContradictoryConditionsError(PresignedPostPolicyError):
+    """Two or more policy conditions can never be satisfied together."""
+
+    fmt = 'Contradictory conditions in presigned POST policy: {detail}.'

@@ -1,0 +1,7 @@
+[
+  {
+    "category": "``s3``",
+    "description": "Add optional local policy validation to ``generate_presigned_post`` via the ``ValidatePolicy`` parameter, which reports missing field conditions, unknown condition types, and contradictory conditions before signing.",
+    "type": "enhancement"
+  }
+]
