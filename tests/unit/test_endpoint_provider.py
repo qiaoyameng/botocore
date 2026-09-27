@@ -714,3 +714,415 @@ def test_auth_scheme_preference(
     ):
         name, scheme = resolver.auth_schemes_to_signing_ctx(auth_schemes)
     assert name == expected_auth_scheme_name
+
+
+SPECIALIZABLE_RULESET_DICT = {
+    "version": "1.0",
+    "parameters": {
+        "Region": {"type": "string", "required": True},
+        "UseFIPS": {"type": "boolean", "default": False},
+        "UseDualStack": {"type": "boolean", "default": False},
+        "Endpoint": {"type": "string"},
+        "Bucket": {"type": "string"},
+    },
+    "rules": [
+        {
+            "type": "tree",
+            "conditions": [
+                {"fn": "isSet", "argv": [{"ref": "Endpoint"}]},
+            ],
+            "rules": [
+                {
+                    "type": "endpoint",
+                    "conditions": [
+                        {
+                            "fn": "parseUrl",
+                            "argv": [{"ref": "Endpoint"}],
+                            "assign": "parsedEndpoint",
+                        },
+                        {
+                            "fn": "isValidHostLabel",
+                            "argv": [
+                                {
+                                    "fn": "getAttr",
+                                    "argv": [
+                                        {"ref": "parsedEndpoint"},
+                                        "authority",
+                                    ],
+                                },
+                                False,
+                            ],
+                        },
+                    ],
+                    "endpoint": {
+                        "url": "{Endpoint}",
+                        "headers": {"x-endpoint": [{"ref": "Endpoint"}]},
+                    },
+                },
+                {
+                    "type": "error",
+                    "conditions": [],
+                    "error": "Invalid endpoint: {Endpoint}",
+                },
+            ],
+        },
+        {
+            "type": "tree",
+            "conditions": [
+                {
+                    "fn": "aws.partition",
+                    "argv": [{"ref": "Region"}],
+                    "assign": "Partition",
+                },
+                {"fn": "booleanEquals", "argv": [{"ref": "UseFIPS"}, True]},
+            ],
+            "rules": [
+                {
+                    "type": "error",
+                    "conditions": [
+                        {
+                            "fn": "booleanEquals",
+                            "argv": [{"ref": "UseDualStack"}, True],
+                        },
+                    ],
+                    "error": "FIPS and dualstack are not supported",
+                },
+                {
+                    "type": "endpoint",
+                    "conditions": [],
+                    "endpoint": {
+                        "url": "https://{Region}.fips.{Partition#dnsSuffix}",
+                        "properties": {
+                            "authSchemes": [
+                                {
+                                    "name": "sigv4",
+                                    "signingName": "myservice",
+                                    "signingRegion": "{Region}",
+                                }
+                            ]
+                        },
+                        "headers": {"x-region": [{"ref": "Region"}]},
+                    },
+                },
+            ],
+        },
+        {
+            "type": "tree",
+            "conditions": [
+                {
+                    "fn": "aws.partition",
+                    "argv": [{"ref": "Region"}],
+                    "assign": "Partition",
+                },
+            ],
+            "rules": [
+                {
+                    "type": "endpoint",
+                    "conditions": [
+                        {
+                            "fn": "booleanEquals",
+                            "argv": [{"ref": "UseDualStack"}, True],
+                        },
+                    ],
+                    "endpoint": {
+                        "url": (
+                            "https://{Region}.dualstack.{Partition#dnsSuffix}"
+                        ),
+                        "properties": {
+                            "authSchemes": [
+                                {
+                                    "name": "sigv4",
+                                    "signingName": "myservice",
+                                    "signingRegion": "{Region}",
+                                }
+                            ]
+                        },
+                    },
+                },
+                {
+                    "type": "endpoint",
+                    "conditions": [
+                        {"fn": "isSet", "argv": [{"ref": "Bucket"}]},
+                    ],
+                    "endpoint": {
+                        "url": (
+                            "https://{Bucket}.{Region}.{Partition#dnsSuffix}"
+                        ),
+                        "headers": {"x-bucket": [{"ref": "Bucket"}]},
+                    },
+                },
+                {
+                    "type": "error",
+                    "conditions": [],
+                    "error": "No endpoint for region {Region}",
+                },
+            ],
+        },
+    ],
+}
+
+
+@pytest.fixture()
+def specializable_provider(partitions):
+    return EndpointProvider(
+        json.loads(json.dumps(SPECIALIZABLE_RULESET_DICT)), partitions
+    )
+
+
+def iter_rules(rules):
+    for rule in rules:
+        yield rule
+        if isinstance(rule, TreeRule):
+            yield from iter_rules(rule.rules)
+
+
+def count_rule_conditions(rules):
+    return sum(len(rule.conditions) for rule in iter_rules(rules))
+
+
+def snapshot_ruleset_structure(rules):
+    """Extract a comparable, deepcopy-safe view of a list of rules."""
+    snapshot = []
+    for rule in rules:
+        entry = {
+            "type": type(rule).__name__,
+            "conditions": json.loads(json.dumps(rule.conditions)),
+            "documentation": rule.documentation,
+            "bound_vars": dict(rule.bound_vars),
+        }
+        if isinstance(rule, TreeRule):
+            entry["rules"] = snapshot_ruleset_structure(rule.rules)
+        if isinstance(rule, EndpointRule):
+            entry["endpoint"] = json.loads(json.dumps(rule.endpoint))
+        if isinstance(rule, ErrorRule):
+            entry["error"] = rule.error
+        snapshot.append(entry)
+    return snapshot
+
+
+def count_evaluated_conditions(ruleset, input_params):
+    """Evaluate a ruleset, counting the rule conditions actually executed."""
+    condition_ids = {
+        id(condition)
+        for rule in iter_rules(ruleset.rules)
+        for condition in rule.conditions
+    }
+    evaluated = []
+    rule_lib = ruleset.rule_lib
+    original_call_function = rule_lib.call_function
+
+    def counting_call_function(func_signature, scope_vars):
+        if id(func_signature) in condition_ids:
+            evaluated.append(func_signature)
+        return original_call_function(func_signature, scope_vars)
+
+    rule_lib.call_function = counting_call_function
+    try:
+        try:
+            ruleset.evaluate(dict(input_params))
+        except EndpointResolutionError:
+            pass
+    finally:
+        del rule_lib.call_function
+    return evaluated
+
+
+SPECIALIZATION_FIXED_PARAMS = {
+    "Region": "us-east-1",
+    "UseFIPS": False,
+    "UseDualStack": False,
+}
+
+SPECIALIZATION_REMAINING_PARAMS = [
+    {},
+    {"Bucket": "mybucket"},
+    {"Endpoint": "https://custom.example.com"},
+    {"Endpoint": "not a url"},
+]
+
+
+@pytest.mark.parametrize(
+    "remaining_params", SPECIALIZATION_REMAINING_PARAMS
+)
+def test_specialized_provider_matches_original(
+    specializable_provider, remaining_params
+):
+    full_params = {**SPECIALIZATION_FIXED_PARAMS, **remaining_params}
+    residual_provider = specializable_provider.specialize(
+        **SPECIALIZATION_FIXED_PARAMS
+    )
+    try:
+        expected = specializable_provider.resolve_endpoint(**full_params)
+    except EndpointResolutionError as ex:
+        with pytest.raises(EndpointResolutionError) as exc_info:
+            residual_provider.resolve_endpoint(**remaining_params)
+        assert str(exc_info.value) == str(ex)
+    else:
+        endpoint = residual_provider.resolve_endpoint(**remaining_params)
+        assert endpoint.url == expected.url
+        assert endpoint.properties == expected.properties
+        assert endpoint.headers == expected.headers
+
+
+def test_specialized_provider_preserves_error_branch(
+    specializable_provider,
+):
+    fixed = {"Region": "us-east-1", "UseFIPS": True, "UseDualStack": True}
+    residual_provider = specializable_provider.specialize(**fixed)
+    with pytest.raises(EndpointResolutionError) as exc_info:
+        specializable_provider.resolve_endpoint(**fixed)
+    expected_error = str(exc_info.value)
+    with pytest.raises(EndpointResolutionError) as exc_info:
+        residual_provider.resolve_endpoint()
+    assert str(exc_info.value) == expected_error
+
+
+def test_specialize_folds_conditions_and_rules(specializable_provider):
+    residual = specializable_provider.specialize(**SPECIALIZATION_FIXED_PARAMS)
+    original_ruleset = specializable_provider.ruleset
+    residual_ruleset = residual.ruleset
+    residual_count = count_rule_conditions(residual_ruleset.rules)
+    original_count = count_rule_conditions(original_ruleset.rules)
+    assert residual_count < original_count
+    # the FIPS subtree can never match with UseFIPS=False and is removed
+    residual_urls = [
+        rule.endpoint["url"]
+        for rule in iter_rules(residual_ruleset.rules)
+        if isinstance(rule, EndpointRule)
+    ]
+    assert not any(".fips." in url for url in residual_urls)
+    # fixed parameters are removed from the residual parameter spec
+    assert not set(SPECIALIZATION_FIXED_PARAMS) & set(
+        residual_ruleset.parameters
+    )
+    assert set(residual_ruleset.parameters) == {"Endpoint", "Bucket"}
+
+
+def test_specialize_does_not_reevaluate_folded_conditions(
+    specializable_provider,
+):
+    residual = specializable_provider.specialize(**SPECIALIZATION_FIXED_PARAMS)
+    remaining_params = {"Bucket": "mybucket"}
+    full_params = {**SPECIALIZATION_FIXED_PARAMS, **remaining_params}
+
+    original_evaluated = count_evaluated_conditions(
+        specializable_provider.ruleset, full_params
+    )
+    residual_evaluated = count_evaluated_conditions(
+        residual.ruleset, remaining_params
+    )
+
+    original_fns = [cond["fn"] for cond in original_evaluated]
+    residual_fns = [cond["fn"] for cond in residual_evaluated]
+    # the residual ruleset executes strictly fewer conditions
+    assert len(residual_evaluated) < len(original_evaluated)
+    # conditions depending only on fixed parameters are never re-evaluated
+    assert "aws.partition" in original_fns
+    assert "aws.partition" not in residual_fns
+    assert "booleanEquals" not in residual_fns
+    # conditions depending on remaining parameters are still evaluated
+    assert "isSet" in residual_fns
+    # repeated evaluation of the residual ruleset stays folded
+    reevaluated = count_evaluated_conditions(
+        residual.ruleset, remaining_params
+    )
+    assert [cond["fn"] for cond in reevaluated] == residual_fns
+
+
+def test_specialize_keeps_unknown_params_unfolded(specializable_provider):
+    # only Region is fixed; UseFIPS/UseDualStack/Endpoint/Bucket are unknown
+    residual = specializable_provider.specialize(Region="us-east-1")
+    residual_fns = [
+        condition["fn"]
+        for rule in iter_rules(residual.ruleset.rules)
+        for condition in rule.conditions
+    ]
+    # conditions on unknown values are kept: they must not be treated as
+    # None or False during specialization
+    assert "isSet" in residual_fns
+    assert "booleanEquals" in residual_fns
+    # aws.partition depends only on Region and is folded away everywhere
+    assert "aws.partition" not in residual_fns
+
+    # the unknown boolean parameters still drive branch selection
+    endpoint = residual.resolve_endpoint(UseFIPS=True, UseDualStack=False)
+    assert endpoint.url == "https://us-east-1.fips.amazonaws.com"
+    with pytest.raises(EndpointResolutionError) as exc_info:
+        residual.resolve_endpoint(UseFIPS=True, UseDualStack=True)
+    assert "FIPS and dualstack are not supported" in str(exc_info.value)
+    endpoint = residual.resolve_endpoint(
+        UseFIPS=False, UseDualStack=False, Bucket="mybucket"
+    )
+    assert endpoint.url == "https://mybucket.us-east-1.amazonaws.com"
+
+
+def test_specialize_does_not_modify_original_ruleset(
+    specializable_provider,
+):
+    ruleset = specializable_provider.ruleset
+    before = snapshot_ruleset_structure(ruleset.rules)
+    specializable_provider.specialize(**SPECIALIZATION_FIXED_PARAMS)
+    after = snapshot_ruleset_structure(ruleset.rules)
+    assert before == after
+    assert all(rule.bound_vars == {} for rule in iter_rules(ruleset.rules))
+    # the original provider still resolves other parameter values
+    endpoint = specializable_provider.resolve_endpoint(
+        Region="eu-west-1", UseFIPS=False, UseDualStack=False, Bucket="bucket"
+    )
+    assert endpoint.url == "https://bucket.eu-west-1.amazonaws.com"
+
+
+def test_specialize_ruleset_returns_reusable_residual(
+    specializable_provider,
+):
+    ruleset = specializable_provider.ruleset
+    residual_ruleset = ruleset.specialize({"Region": "us-east-1"})
+    assert isinstance(residual_ruleset, RuleSet)
+    assert residual_ruleset is not ruleset
+    assert residual_ruleset.bound_vars == {"Region": "us-east-1"}
+    assert "Region" not in residual_ruleset.parameters
+    assert "Region" in ruleset.parameters
+    # the residual ruleset can be evaluated repeatedly
+    for bucket in ("bucket-one", "bucket-two"):
+        endpoint = residual_ruleset.evaluate(
+            {"UseFIPS": False, "UseDualStack": False, "Bucket": bucket}
+        )
+        assert endpoint.url == f"https://{bucket}.us-east-1.amazonaws.com"
+
+
+def test_specialize_applies_default_for_none_value(specializable_provider):
+    residual = specializable_provider.specialize(
+        Region="us-east-1", UseFIPS=None
+    )
+    # UseFIPS=None resolves to its default (False), so the FIPS subtree
+    # is folded away
+    residual_urls = [
+        rule.endpoint["url"]
+        for rule in iter_rules(residual.ruleset.rules)
+        if isinstance(rule, EndpointRule)
+    ]
+    assert not any(".fips." in url for url in residual_urls)
+
+
+def test_specialize_missing_required_param_raises(specializable_provider):
+    with pytest.raises(EndpointResolutionError):
+        specializable_provider.specialize(Region=None)
+
+
+def test_specialize_wrong_param_type_raises(specializable_provider):
+    with pytest.raises(EndpointResolutionError):
+        specializable_provider.specialize(
+            Region="us-east-1", UseFIPS="not-a-bool"
+        )
+
+
+def test_specialize_preserves_excluded_params(
+    specializable_provider, partitions
+):
+    provider = EndpointProvider(
+        json.loads(json.dumps(SPECIALIZABLE_RULESET_DICT)),
+        partitions,
+        excluded_params=frozenset({"Bucket"}),
+    )
+    residual = provider.specialize(Region="us-east-1")
+    assert residual._excluded_params == provider._excluded_params

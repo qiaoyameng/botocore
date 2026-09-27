@@ -22,6 +22,7 @@ or you can look at the test files in /tests/unit/data/endpoints/valid-rules/
 
 import logging
 import re
+from copy import deepcopy
 from enum import Enum
 from string import Formatter
 from typing import NamedTuple
@@ -53,6 +54,9 @@ CACHE_SIZE = 100
 S3_UNREFERENCED_PARAMS = {'Key', 'Prefix', 'CopySource'}
 ARN_PARSER = ArnParser()
 STRING_FORMATTER = Formatter()
+# Sentinel returned when a fully resolvable condition cannot be evaluated at
+# specialization time and must be kept in the residual ruleset.
+_CONDITION_UNFOLDABLE = object()
 
 
 class RuleSetStandardLibrary:
@@ -415,12 +419,24 @@ RuleSetStandardLibary = RuleSetStandardLibrary
 class BaseRule:
     """Base interface for individual endpoint rules."""
 
-    def __init__(self, conditions, documentation=None):
+    def __init__(self, conditions, documentation=None, bound_vars=None):
         self.conditions = conditions
         self.documentation = documentation
+        # Pre-computed scoped variables, used by specialized (partially
+        # evaluated) rulesets. They behave as if conditions that have
+        # already been folded away had assigned them at runtime.
+        self.bound_vars = bound_vars or {}
 
     def evaluate(self, scope_vars, rule_lib):
         raise NotImplementedError()
+
+    def apply_bound_vars(self, scope_vars):
+        """Inject pre-computed scoped variables into the evaluation scope.
+
+        :type scope_vars: dict
+        """
+        if self.bound_vars:
+            scope_vars.update(self.bound_vars)
 
     def evaluate_conditions(self, scope_vars, rule_lib):
         """Determine if all conditions in a rule are met.
@@ -455,6 +471,7 @@ class EndpointRule(BaseRule):
         :type scope_vars: dict
         :rtype: RuleSetEndpoint
         """
+        self.apply_bound_vars(scope_vars)
         if self.evaluate_conditions(scope_vars, rule_lib):
             url = rule_lib.resolve_value(self.endpoint["url"], scope_vars)
             properties = self.resolve_properties(
@@ -521,6 +538,7 @@ class ErrorRule(BaseRule):
         :type rule_lib: RuleSetStandardLibrary
         :rtype: EndpointResolutionError
         """
+        self.apply_bound_vars(scope_vars)
         if self.evaluate_conditions(scope_vars, rule_lib):
             error = rule_lib.resolve_value(self.error, scope_vars)
             raise EndpointResolutionError(msg=error)
@@ -534,7 +552,10 @@ class TreeRule(BaseRule):
 
     def __init__(self, rules, **kwargs):
         super().__init__(**kwargs)
-        self.rules = [RuleCreator.create(**rule) for rule in rules]
+        self.rules = [
+            rule if isinstance(rule, BaseRule) else RuleCreator.create(**rule)
+            for rule in rules
+        ]
 
     def evaluate(self, scope_vars, rule_lib):
         """If a tree rule's conditions are met, iterate its sub-rules
@@ -544,6 +565,7 @@ class TreeRule(BaseRule):
         :type rule_lib: RuleSetStandardLibrary
         :rtype: RuleSetEndpoint/EndpointResolutionError
         """
+        self.apply_bound_vars(scope_vars)
         if self.evaluate_conditions(scope_vars, rule_lib):
             for rule in self.rules:
                 # don't share scope_vars between rules
@@ -656,13 +678,42 @@ class RuleSet:
     """Collection of rules to derive a routable service endpoint."""
 
     def __init__(
-        self, version, parameters, rules, partitions, documentation=None
+        self,
+        version,
+        parameters,
+        rules,
+        partitions,
+        documentation=None,
+        bound_vars=None,
     ):
         self.version = version
         self.parameters = self._ingest_parameter_spec(parameters)
         self.rules = [RuleCreator.create(**rule) for rule in rules]
         self.rule_lib = RuleSetStandardLibrary(partitions)
         self.documentation = documentation
+        # Pre-computed scoped variables, used by specialized (partially
+        # evaluated) rulesets. Empty for rulesets built from raw JSON.
+        self.bound_vars = bound_vars or {}
+
+    @classmethod
+    def _from_components(
+        cls,
+        version,
+        parameters,
+        rules,
+        rule_lib,
+        documentation,
+        bound_vars,
+    ):
+        """Build a RuleSet from pre-ingested components."""
+        ruleset = cls.__new__(cls)
+        ruleset.version = version
+        ruleset.parameters = parameters
+        ruleset.rules = rules
+        ruleset.rule_lib = rule_lib
+        ruleset.documentation = documentation
+        ruleset.bound_vars = bound_vars
+        return ruleset
 
     def _ingest_parameter_spec(self, parameters):
         return {
@@ -695,11 +746,215 @@ class RuleSet:
         :type input_parameters: dict
         """
         self.process_input_parameters(input_parameters)
+        if self.bound_vars:
+            input_parameters.update(self.bound_vars)
         for rule in self.rules:
             evaluation = rule.evaluate(input_parameters.copy(), self.rule_lib)
             if evaluation is not None:
                 return evaluation
         return None
+
+    def specialize(self, fixed_parameters):
+        """Create a residual ruleset with the given parameters pre-evaluated.
+
+        Clients typically fix a number of parameters (for example ``Region``,
+        ``UseFIPS`` and ``UseDualStack``) for their lifetime while still
+        paying the cost of evaluating the full ruleset on every request.
+        Specializing a ruleset evaluates, once, every condition whose inputs
+        are all known and returns a new, reusable ruleset in which:
+
+        * conditions that are fully determined by the fixed parameters are
+          folded away and are never re-evaluated,
+        * rules on branches that can never match are removed,
+        * scoped variables assigned by folded conditions are pre-computed
+          and injected when the residual rule is evaluated,
+        * rule order (priority), template strings, error branches and
+          endpoint properties such as ``authSchemes`` and ``headers`` are
+          preserved.
+
+        A condition is only folded when every value it depends on is known.
+        Conditions that depend on remaining (unknown) parameters are kept
+        as-is; unknown values are never treated as ``None`` or ``False``.
+
+        The residual ruleset is a new object; this ruleset is not modified.
+
+        :type fixed_parameters: dict
+        :param fixed_parameters: Parameter names mapped to their fixed
+            values. Values are validated and processed against the
+            parameter spec, so defaults are applied and missing required
+            parameters raise an error.
+        :rtype: RuleSet
+        """
+        known_values = {}
+        bound_vars = {}
+        for name, value in fixed_parameters.items():
+            if isinstance(value, list):
+                # mirror the list-to-tuple conversion performed when
+                # resolving endpoints with stringarray parameters
+                value = tuple(value)
+            spec = self.parameters.get(name)
+            if spec is not None:
+                value = spec.process_input(value)
+            # A parameter fixed to None is known to be unset. It is used to
+            # fold conditions but, as at runtime, is not added to the scope
+            # of the residual ruleset.
+            known_values[name] = value
+            if value is not None:
+                bound_vars[name] = value
+        specializer = _RuleSpecializer(self.rule_lib)
+        residual_rules = specializer.specialize_rules(self.rules, known_values)
+        residual_parameters = {
+            name: spec
+            for name, spec in self.parameters.items()
+            if name not in fixed_parameters
+        }
+        return type(self)._from_components(
+            version=self.version,
+            parameters=residual_parameters,
+            rules=residual_rules,
+            rule_lib=self.rule_lib,
+            documentation=self.documentation,
+            bound_vars=bound_vars,
+        )
+
+
+class _RuleSpecializer:
+    """Partially evaluates rules against a set of known parameter values.
+
+    Only conditions whose dependencies are all known are folded. Folding a
+    condition never modifies the original rule; residual rules are new
+    objects that share no mutable state with the original ruleset.
+    """
+
+    def __init__(self, rule_lib):
+        self.rule_lib = rule_lib
+
+    def specialize_rules(self, rules, known_values):
+        """Specialize a list of rules, preserving their order.
+
+        :type rules: list of BaseRule
+        :type known_values: dict
+        :rtype: list of BaseRule
+        """
+        residual_rules = []
+        for rule in rules:
+            residual_rule = self.specialize_rule(rule, known_values)
+            if residual_rule is not None:
+                residual_rules.append(residual_rule)
+        return residual_rules
+
+    def specialize_rule(self, rule, known_values):
+        """Specialize a single rule or return None if it can never match.
+
+        :type rule: BaseRule
+        :type known_values: dict
+        :rtype: BaseRule or None
+        """
+        # Each rule is specialized against its own copy of the known values
+        # so that variables assigned by folded conditions do not leak into
+        # sibling rules, matching runtime scoping.
+        known_values = dict(known_values)
+        bound_vars = {}
+        residual_conditions = []
+        for condition in rule.conditions:
+            if not self._is_resolvable(condition, known_values):
+                residual_conditions.append(deepcopy(condition))
+                continue
+            result, assigned = self._evaluate_condition(
+                condition, known_values
+            )
+            if result is _CONDITION_UNFOLDABLE:
+                residual_conditions.append(deepcopy(condition))
+                continue
+            if result is False or result is None:
+                # The condition can never be met with the fixed values, so
+                # the entire rule is dead and can be removed.
+                return None
+            known_values.update(assigned)
+            bound_vars.update(assigned)
+        if isinstance(rule, TreeRule):
+            residual_subrules = self.specialize_rules(rule.rules, known_values)
+            if not residual_subrules:
+                return None
+            return TreeRule(
+                rules=residual_subrules,
+                conditions=residual_conditions,
+                documentation=rule.documentation,
+                bound_vars=bound_vars,
+            )
+        elif isinstance(rule, EndpointRule):
+            return EndpointRule(
+                endpoint=deepcopy(rule.endpoint),
+                conditions=residual_conditions,
+                documentation=rule.documentation,
+                bound_vars=bound_vars,
+            )
+        elif isinstance(rule, ErrorRule):
+            return ErrorRule(
+                error=deepcopy(rule.error),
+                conditions=residual_conditions,
+                documentation=rule.documentation,
+                bound_vars=bound_vars,
+            )
+        raise EndpointResolutionError(
+            msg=f"Cannot specialize unknown rule type: {type(rule)}"
+        )
+
+    def _evaluate_condition(self, condition, known_values):
+        """Evaluate a fully resolvable condition against known values.
+
+        Returns a tuple of the condition result and a dict of any scoped
+        variables assigned by the condition. If evaluation fails, returns
+        ``_CONDITION_UNFOLDABLE`` so the condition is kept in the residual
+        rule, preserving the runtime behavior of raising the error only
+        when the condition is actually reached.
+
+        :rtype: tuple
+        """
+        scope_vars = dict(known_values)
+        try:
+            result = self.rule_lib.call_function(condition, scope_vars)
+        except (EndpointResolutionError, KeyError, TypeError):
+            return _CONDITION_UNFOLDABLE, {}
+        assigned = {
+            name: value
+            for name, value in scope_vars.items()
+            if name not in known_values
+        }
+        return result, assigned
+
+    def _is_resolvable(self, value, known_values):
+        """Determine if a value depends only on known values.
+
+        :type value: Any
+        :type known_values: dict
+        :rtype: bool
+        """
+        if self.rule_lib.is_func(value):
+            return all(
+                self._is_resolvable(arg, known_values)
+                for arg in value["argv"]
+            )
+        elif self.rule_lib.is_ref(value):
+            return value["ref"] in known_values
+        elif self.rule_lib.is_template(value):
+            return self._template_is_resolvable(value, known_values)
+        return True
+
+    def _template_is_resolvable(self, template, known_values):
+        """Determine if all references in a template string are known.
+
+        :type template: str
+        :type known_values: dict
+        :rtype: bool
+        """
+        for _, reference, _, _ in STRING_FORMATTER.parse(template):
+            if reference is None:
+                continue
+            root_reference = reference.split("#")[0]
+            if root_reference not in known_values:
+                return False
+        return True
 
 
 class EndpointProvider:
@@ -708,6 +963,23 @@ class EndpointProvider:
     def __init__(self, ruleset_data, partition_data, excluded_params=None):
         self.ruleset = RuleSet(**ruleset_data, partitions=partition_data)
         self._excluded_params = excluded_params or frozenset()
+
+    def specialize(self, **fixed_parameters):
+        """Create a residual provider with the given parameters pre-evaluated.
+
+        The returned provider is a reusable executor that no longer
+        evaluates rule conditions that depend only on the fixed parameters.
+        Resolving the residual provider with the remaining parameters yields
+        the same endpoints and errors as resolving this provider with the
+        full set of parameters. This provider is not modified.
+
+        :type fixed_parameters: dict
+        :rtype: EndpointProvider
+        """
+        residual = type(self).__new__(type(self))
+        residual.ruleset = self.ruleset.specialize(fixed_parameters)
+        residual._excluded_params = self._excluded_params
+        return residual
 
     def resolve_endpoint(self, **input_parameters):
         for param in self._excluded_params:

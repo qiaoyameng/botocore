@@ -229,6 +229,71 @@ def test_endpoint_provider_test_cases_yielding_errors(
     assert str(exc_info.value) == expected_error
 
 
+# Parameters that a client typically fixes for its lifetime. Specializing a
+# ruleset on these must not change resolution results for the remaining
+# parameters.
+CLIENT_FIXED_PARAMS = ('Region', 'UseFIPS', 'UseDualStack')
+
+
+@pytest.mark.parametrize(
+    'service_name, input_params',
+    [
+        (service_name, test_case.get('params', {}))
+        for service_name, test_case in iter_all_test_cases()
+    ],
+)
+def test_specialized_provider_matches_original(
+    partitions, service_name, input_params
+):
+    ruleset = LOADER.load_service_model(service_name, 'endpoint-rule-set-1')
+    endpoint_provider = EndpointProvider(ruleset, partitions)
+    fixed_params = {
+        name: value
+        for name, value in input_params.items()
+        if name in CLIENT_FIXED_PARAMS
+    }
+    remaining_params = {
+        name: value
+        for name, value in input_params.items()
+        if name not in CLIENT_FIXED_PARAMS
+    }
+    residual_provider = endpoint_provider.specialize(**fixed_params)
+
+    try:
+        expected = endpoint_provider.resolve_endpoint(**input_params)
+    except EndpointResolutionError as ex:
+        with pytest.raises(EndpointResolutionError) as exc_info:
+            residual_provider.resolve_endpoint(**remaining_params)
+        # The generic "no endpoint found" error embeds the input
+        # parameters, which legitimately differ between the two providers.
+        if not str(ex).startswith('No endpoint found'):
+            assert str(exc_info.value) == str(ex)
+    else:
+        endpoint = residual_provider.resolve_endpoint(**remaining_params)
+        assert endpoint.url == expected.url
+        assert endpoint.properties == expected.properties
+        assert endpoint.headers == expected.headers
+
+
+def test_specialized_provider_folds_fixed_branches(partitions):
+    ruleset = LOADER.load_service_model('s3', 'endpoint-rule-set-1')
+    endpoint_provider = EndpointProvider(ruleset, partitions)
+    residual_provider = endpoint_provider.specialize(
+        Region='us-east-1', UseFIPS=False, UseDualStack=False
+    )
+
+    def count_conditions(rules):
+        count = 0
+        for rule in rules:
+            count += len(rule.conditions)
+            count += count_conditions(getattr(rule, 'rules', []))
+        return count
+
+    original_count = count_conditions(endpoint_provider.ruleset.rules)
+    residual_count = count_conditions(residual_provider.ruleset.rules)
+    assert 0 < residual_count < original_count
+
+
 @pytest.mark.parametrize(
     'service_name, op_name, op_params, builtin_params, expected_endpoint',
     iter_e2e_test_cases_that_produce(endpoints=True),
